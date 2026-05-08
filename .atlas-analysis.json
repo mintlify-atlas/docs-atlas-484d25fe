@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Lightpress",
+  "projectType": "saas",
+  "projectName": "Lightpress",
+  "projectDescription": "Lightpress is a clean, organized full-stack SaaS platform built on a microservices architecture deployed on AWS.",
   "theme": "luma",
-  "colors": {
-    "primary": "#5B6AF0",
-    "light": "#EEF0FE",
-    "dark": "#3A45C2"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/reds-skywalker/Lightpress"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/reds-skywalker/Lightpress"
-    }
-  },
+  "primaryColor": "#5B6AF0",
+  "lightColor": "#EEF0FE",
+  "darkColor": "#3A45C2",
   "navigation": {
     "tabs": [
       {
@@ -79,5 +67,22 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Microservices architecture for independent service scaling",
+    "AWS CloudFormation infrastructure as code",
+    "Docker-based local development and deployment",
+    "AWS CodeBuild CI/CD pipeline via buildspec",
+    "Frontend client application",
+    "Bash and Python automation scripts"
+  ],
+  "publicApiSurface": [
+    "docker-compose.yml — local multi-service orchestration",
+    "buildspec.yml — AWS CodeBuild pipeline definition",
+    "infraestructure/cloudformation/ — AWS resource templates",
+    "scripts/bash/ — shell automation scripts",
+    "scripts/python/ — Python automation scripts",
+    "client/ — frontend application",
+    "microservices/ — backend service modules"
+  ]
 }

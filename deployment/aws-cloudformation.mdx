@@ -1,0 +1,172 @@
+---
+title: "Deploy Lightpress infrastructure with CloudFormation"
+description: "Use AWS CloudFormation to provision and manage Lightpress production infrastructure repeatably, with support for stack parameters, updates, and safe rollback."
+---
+
+Lightpress stores its AWS infrastructure definitions as CloudFormation templates in the `infraestructure/cloudformation/` directory. CloudFormation lets you treat infrastructure as code — each stack describes the AWS resources it manages, and you deploy or update it with a single CLI command. This approach makes environments reproducible and keeps infrastructure changes auditable alongside application code.
+
+## What CloudFormation provisions
+
+Lightpress CloudFormation templates are designed to provision the AWS resources that support a microservices SaaS architecture. Depending on the templates you deploy, stacks can manage resources across the following service categories:
+
+<AccordionGroup>
+  <Accordion title="Compute and containers">
+    ECS clusters, ECS task definitions, ECS services, and ECR repositories for storing Docker images built by CodeBuild. Each microservice in `microservices/` maps to its own ECS service.
+  </Accordion>
+  <Accordion title="Networking">
+    VPCs, subnets, internet gateways, NAT gateways, security groups, and Application Load Balancers that route traffic to the appropriate microservice.
+  </Accordion>
+  <Accordion title="Storage and databases">
+    S3 buckets for static assets and build artifacts, and managed database resources for persistent microservice data.
+  </Accordion>
+  <Accordion title="IAM">
+    IAM roles and policies that grant least-privilege access for ECS tasks, CodeBuild projects, and cross-service calls.
+  </Accordion>
+  <Accordion title="CI/CD">
+    CodeBuild projects and any CodePipeline resources that automate the build and deployment workflow defined in `buildspec.yml`.
+  </Accordion>
+</AccordionGroup>
+
+## Deploying a stack
+
+Use the `aws cloudformation deploy` command to create a new stack or update an existing one. The command is idempotent — if the stack already exists and the template has not changed, it completes without making any changes.
+
+<Steps>
+  <Step title="Configure the AWS CLI">
+    Make sure the AWS CLI is configured with credentials that have permission to create and manage the resources in your template.
+
+    ```bash
+    aws configure
+    ```
+
+    Verify your identity before deploying:
+
+    ```bash
+    aws sts get-caller-identity
+    ```
+  </Step>
+
+  <Step title="Package the template (if it uses local references)">
+    If your template references local files (such as nested stacks or Lambda function code), package it first to upload those artifacts to S3 and produce a deployable template.
+
+    ```bash
+    aws cloudformation package \
+      --template-file infraestructure/cloudformation/main.yaml \
+      --s3-bucket your-artifacts-bucket \
+      --output-template-file infraestructure/cloudformation/packaged.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy the stack">
+    Run `aws cloudformation deploy` with your template file and stack name. Pass parameters using `--parameter-overrides`.
+
+    ```bash
+    aws cloudformation deploy \
+      --template-file infraestructure/cloudformation/packaged.yaml \
+      --stack-name lightpress-production \
+      --parameter-overrides \
+          Environment=production \
+          AppVersion=1.0.0 \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --region us-east-1
+    ```
+
+    The `--capabilities CAPABILITY_NAMED_IAM` flag is required when your template creates named IAM resources.
+  </Step>
+
+  <Step title="Monitor the deployment">
+    Track stack events in real time from the AWS Management Console, or poll with the CLI:
+
+    ```bash
+    aws cloudformation describe-stack-events \
+      --stack-name lightpress-production \
+      --query "StackEvents[*].[Timestamp,LogicalResourceId,ResourceStatus]" \
+      --output table
+    ```
+
+    Wait for the stack to reach a stable state:
+
+    ```bash
+    aws cloudformation wait stack-create-complete \
+      --stack-name lightpress-production
+    ```
+  </Step>
+
+  <Step title="Verify stack outputs">
+    After a successful deployment, retrieve the stack outputs to get resource identifiers such as load balancer URLs and ECR repository URIs:
+
+    ```bash
+    aws cloudformation describe-stacks \
+      --stack-name lightpress-production \
+      --query "Stacks[0].Outputs" \
+      --output table
+    ```
+  </Step>
+</Steps>
+
+## Stack parameters
+
+Pass configuration values to your templates using `--parameter-overrides`. Common parameters for Lightpress stacks:
+
+| Parameter | Description | Example |
+|---|---|---|
+| `Environment` | Deployment environment | `production`, `staging` |
+| `AppVersion` | Application version tag | `1.0.0`, `main-abc1234` |
+| `VpcCidr` | CIDR block for the VPC | `10.0.0.0/16` |
+| `DesiredCount` | Number of ECS task replicas | `2` |
+| `DBInstanceClass` | RDS instance type | `db.t3.micro` |
+
+For a full list of parameters, inspect the `Parameters` section of each template file in `infraestructure/cloudformation/`.
+
+## Updating a stack
+
+Use the same `aws cloudformation deploy` command to update an existing stack. CloudFormation computes a change set — a diff between the current and desired state — and applies only the required changes.
+
+```bash
+aws cloudformation deploy \
+  --template-file infraestructure/cloudformation/packaged.yaml \
+  --stack-name lightpress-production \
+  --parameter-overrides \
+      Environment=production \
+      AppVersion=1.1.0 \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+<Tip>
+  Review the change set before applying it in production by running `aws cloudformation create-change-set` first and inspecting the proposed changes.
+</Tip>
+
+## Rollback behavior
+
+If a stack update fails, CloudFormation automatically rolls back all changes in the update to the last known stable state. You can monitor rollback progress the same way you monitor deployments:
+
+```bash
+aws cloudformation describe-stack-events \
+  --stack-name lightpress-production \
+  --query "StackEvents[?contains(ResourceStatus, 'ROLLBACK')][Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+  --output table
+```
+
+<Warning>
+  Some resource types — such as RDS databases with deletion protection enabled — can block rollback. Resolve the blocking condition manually before CloudFormation can complete the rollback.
+</Warning>
+
+## Deleting a stack
+
+Deleting a stack removes all the resources it manages. This action is destructive and cannot be undone for stateful resources like databases and S3 buckets unless you have backups.
+
+```bash
+aws cloudformation delete-stack \
+  --stack-name lightpress-production
+```
+
+Wait for deletion to complete:
+
+```bash
+aws cloudformation wait stack-delete-complete \
+  --stack-name lightpress-production
+```
+
+<Warning>
+  Deleting a production stack removes databases, S3 buckets, and all associated data unless those resources have `DeletionPolicy: Retain` set in the template. Verify your templates before running `delete-stack` against a production environment.
+</Warning>

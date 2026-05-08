@@ -1,0 +1,270 @@
+---
+title: "AWS CodeBuild buildspec reference for Lightpress"
+description: "Reference for the Lightpress buildspec.yml: phases, environment variables, artifacts, cache, and examples for building and deploying microservices to AWS."
+---
+
+Lightpress uses AWS CodeBuild as its CI/CD execution environment. The `buildspec.yml` file at the project root tells CodeBuild how to build, test, and deploy each service. A single buildspec can handle all microservices sequentially, or you can maintain one buildspec per service for independent pipelines — Lightpress ships with a single shared buildspec that iterates over the `microservices/` directory.
+
+<Info>
+  CodeBuild executes the buildspec in a managed build environment that you choose when configuring the project. Lightpress uses the standard AWS managed image `aws/codebuild/standard:7.0`, which includes Node.js 20 and Python 3.11 out of the box.
+</Info>
+
+## Buildspec format
+
+A `buildspec.yml` has four top-level sections:
+
+| Section | Required | Purpose |
+|---------|----------|---------|
+| `version` | Yes | Buildspec schema version. Always `0.2`. |
+| `env` | No | Declare environment variables and secrets. |
+| `phases` | Yes | Ordered commands: install → pre_build → build → post_build. |
+| `artifacts` | No | Files to export after a successful build. |
+| `cache` | No | Directories to cache between builds to speed up installs. |
+
+## Complete example
+
+The following buildspec builds all Node.js microservices, runs tests, builds Docker images, pushes them to Amazon ECR, and triggers a deployment update.
+
+```yaml buildspec.yml
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: us-east-1
+    ECR_REGISTRY: 123456789.dkr.ecr.us-east-1.amazonaws.com
+    IMAGE_TAG: latest
+  parameter-store:
+    DB_PASSWORD: /lightpress/prod/DB_PASSWORD
+    JWT_SECRET: /lightpress/prod/JWT_SECRET
+  secrets-manager:
+    STRIPE_SECRET_KEY: lightpress/prod/stripe:STRIPE_SECRET_KEY
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.11
+    commands:
+      - echo "Installing global tooling..."
+      - npm install -g npm@latest
+      - pip install awscli --upgrade
+      - echo "Installing client dependencies..."
+      - cd client && npm ci && cd ..
+      - echo "Installing microservice dependencies..."
+      - for dir in microservices/*/; do
+          echo "Installing $dir...";
+          (cd "$dir" && npm ci);
+        done
+
+  pre_build:
+    commands:
+      - echo "Running linters..."
+      - cd client && npm run lint && cd ..
+      - for dir in microservices/*/; do
+          (cd "$dir" && npm run lint);
+        done
+      - echo "Running unit tests..."
+      - for dir in microservices/*/; do
+          (cd "$dir" && npm test -- --ci --coverage);
+        done
+      - echo "Authenticating with Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_REGION |
+          docker login --username AWS --password-stdin $ECR_REGISTRY
+
+  build:
+    commands:
+      - echo "Building microservice Docker images..."
+      - for dir in microservices/*/; do
+          SERVICE=$(basename "$dir");
+          echo "Building $SERVICE...";
+          docker build
+            -t $ECR_REGISTRY/lightpress-$SERVICE:$IMAGE_TAG
+            -t $ECR_REGISTRY/lightpress-$SERVICE:$CODEBUILD_RESOLVED_SOURCE_VERSION
+            "$dir";
+        done
+      - echo "Building client..."
+      - cd client && npm run build && cd ..
+
+  post_build:
+    commands:
+      - echo "Pushing images to ECR..."
+      - for dir in microservices/*/; do
+          SERVICE=$(basename "$dir");
+          docker push $ECR_REGISTRY/lightpress-$SERVICE:$IMAGE_TAG;
+          docker push $ECR_REGISTRY/lightpress-$SERVICE:$CODEBUILD_RESOLVED_SOURCE_VERSION;
+        done
+      - echo "Updating ECS services..."
+      - for dir in microservices/*/; do
+          SERVICE=$(basename "$dir");
+          aws ecs update-service
+            --cluster lightpress-prod
+            --service lightpress-$SERVICE
+            --force-new-deployment
+            --region $AWS_REGION;
+        done
+      - echo "Deploying client build to S3..."
+      - aws s3 sync client/dist s3://lightpress-client-prod --delete
+      - aws cloudfront create-invalidation
+          --distribution-id $CLOUDFRONT_DISTRIBUTION_ID
+          --paths "/*"
+      - echo "Build and deployment complete."
+
+artifacts:
+  files:
+    - client/dist/**/*
+    - microservices/**/coverage/**/*
+  discard-paths: no
+  base-directory: .
+
+cache:
+  paths:
+    - client/node_modules/**/*
+    - microservices/*/node_modules/**/*
+    - /root/.npm/**/*
+```
+
+## Phases
+
+### `install`
+
+The `install` phase runs before any of your code. Use it to:
+
+- Declare runtime versions using `runtime-versions` (Node.js, Python, Java, etc.)
+- Install global CLI tools (`npm`, `pip`, `awscli`)
+- Install project dependencies with `npm ci` or `pip install -r requirements.txt`
+
+<Tip>
+  Use `npm ci` instead of `npm install` in CI environments. It installs exactly what is in your lockfile, is faster, and fails immediately if the lockfile is out of date.
+</Tip>
+
+### `pre_build`
+
+Runs after install but before the main build. Use it to:
+
+- Run linters and static analysis
+- Execute unit and integration tests
+- Authenticate with external registries (ECR, npm, PyPI)
+- Generate code or run database migrations
+
+If any command in `pre_build` exits with a non-zero code, the build fails and `build` / `post_build` do not run.
+
+### `build`
+
+The primary compilation phase. Use it to:
+
+- Compile TypeScript with `tsc` or bundle with a tool like Vite or esbuild
+- Build Docker images with `docker build`
+- Package Lambda functions or CloudFormation templates
+
+### `post_build`
+
+Runs after `build` succeeds. Use it to:
+
+- Push Docker images to ECR
+- Deploy to ECS, Lambda, or S3
+- Send notifications (Slack, SNS)
+- Write deployment metadata for downstream pipelines
+
+<Warning>
+  `post_build` still executes if `build` fails. Check `$CODEBUILD_BUILD_SUCCEEDING` if you need to skip post-build steps on failure: `if [ $CODEBUILD_BUILD_SUCCEEDING -eq 1 ]; then ...`.
+</Warning>
+
+## Environment variables
+
+CodeBuild makes the following variables available automatically in every build. You do not need to declare them.
+
+| Variable | Description |
+|----------|-------------|
+| `CODEBUILD_BUILD_ID` | Unique identifier for the current build run. |
+| `CODEBUILD_BUILD_NUMBER` | Sequential build number within the project. |
+| `CODEBUILD_BUILD_SUCCEEDING` | `1` if all phases so far have succeeded, `0` otherwise. |
+| `CODEBUILD_RESOLVED_SOURCE_VERSION` | Full Git commit SHA of the source being built. Use as a Docker image tag for immutable references. |
+| `CODEBUILD_SOURCE_REPO_URL` | URL of the source repository. |
+| `CODEBUILD_SRC_DIR` | Path to the directory where source code was checked out (default: `/codebuild/output/src*/src`). |
+| `AWS_DEFAULT_REGION` | AWS region of the CodeBuild project. Same as `AWS_REGION`. |
+| `AWS_ACCOUNT_ID` | AWS account ID of the CodeBuild project. |
+
+## Sourcing secrets
+
+Hardcoding secret values in `buildspec.yml` is a security risk — even when the file is in a private repository. Use one of the following approaches instead:
+
+<Tabs>
+  <Tab title="Parameter Store">
+    Reference SSM Parameter Store values in the `env.parameter-store` block. CodeBuild retrieves them at build start and injects them as environment variables.
+
+    ```yaml
+    env:
+      parameter-store:
+        DB_PASSWORD: /lightpress/prod/DB_PASSWORD
+        JWT_SECRET: /lightpress/prod/JWT_SECRET
+    ```
+
+    The CodeBuild service role must have `ssm:GetParameters` permission on the relevant parameter paths.
+  </Tab>
+  <Tab title="Secrets Manager">
+    For structured secrets (e.g. JSON objects with multiple keys), use the `env.secrets-manager` block. Append `:KEY_NAME` to extract a specific field from a JSON secret.
+
+    ```yaml
+    env:
+      secrets-manager:
+        STRIPE_SECRET_KEY: lightpress/prod/stripe:STRIPE_SECRET_KEY
+        STRIPE_WEBHOOK_SECRET: lightpress/prod/stripe:STRIPE_WEBHOOK_SECRET
+    ```
+
+    The CodeBuild service role must have `secretsmanager:GetSecretValue` permission on the secret ARN.
+  </Tab>
+  <Tab title="CodeBuild console">
+    For non-sensitive configuration that changes between environments, define environment variables directly in the CodeBuild project settings in the AWS console or via CloudFormation. These override values in `buildspec.yml`.
+  </Tab>
+</Tabs>
+
+## Artifacts
+
+The `artifacts` section defines which files CodeBuild exports to S3 after a successful build. These can be consumed by downstream pipeline stages (e.g. a deployment stage in CodePipeline).
+
+```yaml
+artifacts:
+  files:
+    - client/dist/**/*       # compiled frontend bundle
+    - "**/*.template.json"   # CloudFormation templates
+  discard-paths: no          # preserve directory structure in the artifact zip
+  base-directory: .
+```
+
+Set `discard-paths: yes` to flatten all matched files into the root of the artifact zip, which is useful when a downstream action expects files at the top level.
+
+## Cache
+
+Caching `node_modules` dramatically reduces install time. CodeBuild stores the cached directories in S3 between builds and restores them at the start of the next build.
+
+```yaml
+cache:
+  paths:
+    - client/node_modules/**/*
+    - microservices/*/node_modules/**/*
+    - /root/.npm/**/*
+    - /root/.cache/pip/**/*   # Python pip cache
+```
+
+<Info>
+  You must enable caching in the CodeBuild project settings (choose "Amazon S3" as the cache type and specify a bucket) for the `cache` section in `buildspec.yml` to have any effect.
+</Info>
+
+## Debugging a failed build
+
+When a build fails, the most useful debugging approaches are:
+
+<Steps>
+  <Step title="Check the phase log">
+    In the AWS console, open the failed build and expand the phase that failed. Each command's stdout and stderr is captured there.
+  </Step>
+  <Step title="Add verbose output">
+    Temporarily add `set -x` at the top of the failing phase's `commands` list to print every command before it executes. Remember to remove it before merging.
+  </Step>
+  <Step title="Reproduce locally with CodeBuild Local">
+    AWS provides a [CodeBuild local agent](https://docs.aws.amazon.com/codebuild/latest/userguide/use-codebuild-agent.html) Docker image that lets you run your buildspec locally without pushing to AWS. This is the fastest way to iterate on build scripts.
+  </Step>
+  <Step title="Verify IAM permissions">
+    Permission errors often appear as cryptic `AccessDenied` messages. Check that the CodeBuild service role has the necessary permissions for every AWS API call made in the buildspec (ECR, ECS, S3, SSM, Secrets Manager, CloudFront).
+  </Step>
+</Steps>

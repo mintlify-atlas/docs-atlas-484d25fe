@@ -1,0 +1,192 @@
+---
+title: "Environment variables: Lightpress configuration reference"
+description: "Complete reference for all environment variables used by Lightpress services, including app settings, database connections, AWS credentials, and feature flags."
+---
+
+Every Lightpress service reads its configuration from environment variables at startup. During local development these values live in a `.env` file at the project root (excluded from version control via `.gitignore`). In production, you supply them through your deployment pipeline — typically as CodeBuild environment variables or AWS Systems Manager Parameter Store entries.
+
+<Note>
+  Never commit `.env` to version control. Use `.env.example` to document required variables with safe placeholder values so that other developers know what to configure.
+</Note>
+
+## Application settings
+
+These variables control the runtime behavior common to all Node.js services in Lightpress.
+
+<ParamField path="NODE_ENV" type="string" default="development">
+  Runtime environment. Affects logging verbosity, error detail in responses, and performance optimizations. Accepted values: `development`, `test`, `production`.
+</ParamField>
+
+<ParamField path="PORT" type="number" default="3000">
+  The port each service listens on. When running multiple services locally, set a different port per service (e.g. `3001`, `3002`) to avoid conflicts. In Docker Compose this is handled by port mapping, so you can leave the default.
+</ParamField>
+
+<ParamField path="LOG_LEVEL" type="string" default="info">
+  Minimum log severity to emit. Accepted values: `error`, `warn`, `info`, `http`, `debug`. Set to `debug` locally for verbose output; use `warn` or `error` in production to reduce log volume and cost.
+</ParamField>
+
+<ParamField path="SERVICE_NAME" type="string" required>
+  A short identifier for the running service (e.g. `auth-service`, `billing-service`). Included in structured log output to make it easy to filter logs in CloudWatch.
+</ParamField>
+
+## Database
+
+Lightpress uses a relational database for persistent state. Configure the connection using individual components or a single connection string.
+
+<ParamField path="DB_HOST" type="string" required>
+  Hostname or IP address of the database server. Locally this is typically `localhost` or the Docker Compose service name (e.g. `postgres`).
+</ParamField>
+
+<ParamField path="DB_PORT" type="number" default="5432">
+  Database server port. Default is the standard PostgreSQL port. Adjust if you run a non-standard port or use a different engine.
+</ParamField>
+
+<ParamField path="DB_NAME" type="string" required>
+  Name of the database to connect to. Create separate databases per environment (e.g. `lightpress_dev`, `lightpress_test`, `lightpress_prod`) to prevent accidental data contamination.
+</ParamField>
+
+<ParamField path="DB_USER" type="string" required>
+  Database user that Lightpress services authenticate as. This user should have the minimum permissions required — typically `SELECT`, `INSERT`, `UPDATE`, `DELETE` on application tables only.
+</ParamField>
+
+<ParamField path="DB_PASSWORD" type="string" required>
+  Password for `DB_USER`. In production, retrieve this value from AWS Secrets Manager rather than storing it as a plaintext environment variable.
+</ParamField>
+
+<ParamField path="DATABASE_URL" type="string">
+  Full connection string as an alternative to the individual `DB_*` variables. Format: `postgresql://user:password@host:port/dbname`. When set, this takes precedence over the individual variables.
+</ParamField>
+
+## AWS credentials and region
+
+These variables are required when any Lightpress service interacts with AWS — for example, uploading files to S3, reading from SQS, or writing to DynamoDB.
+
+<Warning>
+  Do not hardcode AWS credentials in source code or commit them to version control. Use IAM roles for services running on AWS (ECS, Lambda, EC2), and use short-lived credentials or AWS profiles for local development.
+</Warning>
+
+<ParamField path="AWS_REGION" type="string" required>
+  The AWS region where Lightpress resources are deployed (e.g. `us-east-1`, `eu-west-1`). All AWS SDK calls default to this region.
+</ParamField>
+
+<ParamField path="AWS_ACCESS_KEY_ID" type="string">
+  AWS access key ID for programmatic access. Required only for local development when you are not using an IAM role or AWS profile. On AWS infrastructure, leave this unset and rely on the instance/task role instead.
+</ParamField>
+
+<ParamField path="AWS_SECRET_ACCESS_KEY" type="string">
+  AWS secret access key paired with `AWS_ACCESS_KEY_ID`. Same caveats apply — omit on AWS-hosted environments and use IAM roles.
+</ParamField>
+
+<ParamField path="AWS_S3_BUCKET" type="string">
+  Name of the S3 bucket used for file storage (uploads, exports, static assets). The bucket must exist in the region specified by `AWS_REGION` before services start.
+</ParamField>
+
+<ParamField path="AWS_SQS_QUEUE_URL" type="string">
+  Full URL of the SQS queue used for async job processing between microservices. Format: `https://sqs.<region>.amazonaws.com/<account-id>/<queue-name>`.
+</ParamField>
+
+## Service URLs
+
+Each microservice exposes an HTTP API. Other services and the client use these URLs to communicate internally.
+
+<ParamField path="AUTH_SERVICE_URL" type="string" required>
+  Base URL of the authentication service. Example: `http://localhost:3001` locally, or an internal load balancer DNS name in production.
+</ParamField>
+
+<ParamField path="BILLING_SERVICE_URL" type="string">
+  Base URL of the billing service. Required if billing features are enabled. Leave unset to disable billing-related functionality.
+</ParamField>
+
+<ParamField path="NOTIFICATIONS_SERVICE_URL" type="string">
+  Base URL of the notifications service. Used by other services to trigger emails, push notifications, or webhooks.
+</ParamField>
+
+<ParamField path="CLIENT_URL" type="string" required>
+  Public-facing URL of the frontend client. Used by backend services to build redirect URLs and configure CORS allow-lists. Example: `http://localhost:5173` for local Vite dev server.
+</ParamField>
+
+<ParamField path="API_GATEWAY_URL" type="string">
+  Base URL of the API Gateway if traffic is routed through AWS API Gateway rather than directly to service load balancers. Leave unset to skip API Gateway routing.
+</ParamField>
+
+## Authentication
+
+<ParamField path="JWT_SECRET" type="string" required>
+  Secret used to sign and verify JSON Web Tokens. Must be a long, random string (minimum 32 characters). Generate with `openssl rand -hex 32`. Rotate this value if it is ever exposed.
+</ParamField>
+
+<ParamField path="JWT_EXPIRY" type="string" default="15m">
+  Lifetime of access tokens issued by the auth service. Accepts any value parseable by the `ms` package (e.g. `15m`, `1h`, `7d`). Shorter values are more secure; pair with a refresh token strategy for long sessions.
+</ParamField>
+
+<ParamField path="REFRESH_TOKEN_SECRET" type="string" required>
+  Separate secret for signing refresh tokens. Must differ from `JWT_SECRET`.
+</ParamField>
+
+<ParamField path="REFRESH_TOKEN_EXPIRY" type="string" default="7d">
+  Lifetime of refresh tokens. Longer than `JWT_EXPIRY` by design. Users are required to re-authenticate after this period.
+</ParamField>
+
+## Feature flags
+
+Feature flags let you enable or disable functionality at runtime without redeploying. All flags default to `false` (disabled) unless specified otherwise.
+
+<ParamField path="FEATURE_BILLING_ENABLED" type="boolean" default="false">
+  Enable the billing subsystem and expose billing-related API endpoints. Set to `true` once you have configured Stripe keys and the billing service URL.
+</ParamField>
+
+<ParamField path="FEATURE_EMAIL_VERIFICATION" type="boolean" default="true">
+  Require new users to verify their email address before accessing the application. Disable only in development or test environments where you want to bypass the verification flow.
+</ParamField>
+
+<ParamField path="FEATURE_RATE_LIMITING" type="boolean" default="true">
+  Enable per-IP and per-user rate limiting on public API endpoints. Disable only in local or test environments where automated tests would otherwise hit limits.
+</ParamField>
+
+<ParamField path="FEATURE_MAINTENANCE_MODE" type="boolean" default="false">
+  When `true`, all API endpoints return a `503 Service Unavailable` response with a maintenance message. Use during planned downtime or deployments that require data migrations.
+</ParamField>
+
+## Quick reference
+
+<Tip>
+  Copy the block below to create your `.env.example` file. Replace actual secret values with descriptive placeholders so they are never stored in version control.
+</Tip>
+
+```bash .env.example
+# Application
+NODE_ENV=development
+PORT=3000
+LOG_LEVEL=info
+SERVICE_NAME=your-service-name
+
+# Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=lightpress_dev
+DB_USER=lightpress
+DB_PASSWORD=changeme
+
+# AWS
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your-access-key-id
+AWS_SECRET_ACCESS_KEY=your-secret-access-key
+AWS_S3_BUCKET=your-s3-bucket-name
+AWS_SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789/your-queue
+
+# Service URLs
+AUTH_SERVICE_URL=http://localhost:3001
+CLIENT_URL=http://localhost:5173
+
+# Auth
+JWT_SECRET=change-this-to-a-random-secret
+JWT_EXPIRY=15m
+REFRESH_TOKEN_SECRET=change-this-to-a-different-random-secret
+REFRESH_TOKEN_EXPIRY=7d
+
+# Feature flags
+FEATURE_BILLING_ENABLED=false
+FEATURE_EMAIL_VERIFICATION=true
+FEATURE_RATE_LIMITING=true
+FEATURE_MAINTENANCE_MODE=false
+```

@@ -1,0 +1,204 @@
+---
+title: "Microservices backend architecture in Lightpress"
+description: "The microservices/ directory holds Lightpress backend services — each independently deployable, domain-scoped, and scalable without affecting other services."
+---
+
+The `microservices/` directory is the core of the Lightpress backend. Each subdirectory is a self-contained Node.js service with its own `package.json`, Dockerfile, and environment configuration. Services communicate with each other through well-defined interfaces — either synchronous HTTP calls or asynchronous events — and are deployed independently so that a change to one service never requires a full-stack redeploy.
+
+## Service organization
+
+Each service lives in its own directory under `microservices/`. This gives you clear ownership boundaries: one team or one pull request per service.
+
+```
+microservices/
+├── auth/
+│   ├── src/
+│   ├── package.json
+│   ├── Dockerfile
+│   └── .env.example
+├── users/
+│   ├── src/
+│   ├── package.json
+│   └── Dockerfile
+├── billing/
+│   ├── src/
+│   ├── package.json
+│   └── Dockerfile
+└── notifications/
+    ├── src/
+    ├── package.json
+    └── Dockerfile
+```
+
+<Info>
+  The names above are illustrative. Your actual service names are determined by the subdirectories you add under `microservices/`. Follow the same structure for each: a `src/` directory, a `Dockerfile`, and a `.env.example`.
+</Info>
+
+## Core services
+
+Lightpress is designed around the bounded contexts common to SaaS products. Each service owns a single domain.
+
+<CardGroup cols={2}>
+  <Card title="Auth service" icon="lock">
+    Issues and validates JWTs. Handles sign-up, login, password reset, and token refresh. Every other service validates tokens against this service's public key.
+  </Card>
+  <Card title="Users service" icon="user">
+    Manages user profiles, roles, and account settings. The auth service creates a user record here on sign-up; the client reads from here to populate the UI.
+  </Card>
+  <Card title="Billing service" icon="credit-card">
+    Integrates with a payment provider (e.g., Stripe) to manage subscriptions, invoices, and plan changes. Emits events when a subscription status changes.
+  </Card>
+  <Card title="Notifications service" icon="bell">
+    Sends email and in-app notifications. Subscribes to events from other services (e.g., a billing event triggers a receipt email) rather than being called directly.
+  </Card>
+</CardGroup>
+
+## Service communication patterns
+
+Services use two communication patterns depending on whether the caller needs an immediate response.
+
+<Tabs>
+  <Tab title="Synchronous (HTTP/REST)">
+    Use direct HTTP calls when the caller must wait for a result — for example, the client asking the users service to return a profile.
+
+    ```typescript
+    // Inside a service — calling another service by its Docker Compose name
+    const response = await fetch('http://users-service:3001/users/me', {
+      headers: { Authorization: req.headers.authorization },
+    });
+    const user = await response.json();
+    ```
+
+    In production, inter-service calls go through an internal ALB or AWS App Mesh service discovery — not through the public-facing ALB. This keeps internal traffic off the public internet.
+  </Tab>
+  <Tab title="Asynchronous (events)">
+    Use events for work that doesn't need to block the caller — sending a welcome email after sign-up, updating a dashboard metric after a payment, etc.
+
+    Lightpress uses Amazon SQS (or SNS + SQS fan-out) for event delivery between services.
+
+    ```typescript
+    // Producer: billing service emits a subscription event
+    import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+
+    const sqs = new SQSClient({ region: process.env.AWS_REGION });
+
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: process.env.SUBSCRIPTION_EVENTS_QUEUE_URL,
+      MessageBody: JSON.stringify({
+        type: 'subscription.activated',
+        userId: user.id,
+        plan: 'pro',
+      }),
+    }));
+    ```
+
+    ```typescript
+    // Consumer: notifications service polls the queue
+    // and sends a confirmation email
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Keep synchronous calls for reads and immediate writes. Use events for side effects. This prevents cascading failures — if the notifications service is down, billing still works.
+</Note>
+
+## Independent deployability
+
+Each service has its own Dockerfile and is built separately in the CI pipeline. You can update, scale, and roll back any single service without touching the others.
+
+<Steps>
+  <Step title="Build a single service image">
+    ```bash
+    docker build -t lightpress-auth ./microservices/auth
+    ```
+  </Step>
+  <Step title="Push to Amazon ECR">
+    ```bash
+    aws ecr get-login-password --region us-east-1 | \
+      docker login --username AWS --password-stdin \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com
+
+    docker tag lightpress-auth \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com/lightpress-auth:latest
+
+    docker push \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com/lightpress-auth:latest
+    ```
+  </Step>
+  <Step title="Deploy to ECS">
+    Update the ECS service to pull the new image. The CloudFormation templates in `infraestructure/cloudformation/` define the ECS task definitions for each service.
+
+    ```bash
+    aws ecs update-service \
+      --cluster lightpress-prod \
+      --service auth-service \
+      --force-new-deployment
+    ```
+  </Step>
+</Steps>
+
+## Local vs production differences
+
+<AccordionGroup>
+  <Accordion title="Local development (Docker Compose)">
+    In local development, Docker Compose orchestrates all services. Services find each other by their Compose service name (e.g., `http://auth-service:3000`).
+
+    - No AWS credentials required for core functionality
+    - Use LocalStack to emulate SQS, S3, and other AWS services locally
+    - Hot-reload (e.g., `nodemon`) is enabled inside each service container
+    - A single `docker compose up` starts every service and the client
+
+    ```yaml
+    # docker-compose.yml excerpt
+    services:
+      auth-service:
+        build: ./microservices/auth
+        ports:
+          - "3001:3000"
+        env_file: ./microservices/auth/.env
+      users-service:
+        build: ./microservices/users
+        ports:
+          - "3002:3000"
+        env_file: ./microservices/users/.env
+    ```
+  </Accordion>
+  <Accordion title="Production (AWS ECS)">
+    In production, each service runs as an ECS task behind an Application Load Balancer. AWS manages container placement, health checks, and rolling deployments.
+
+    - Services discover each other through AWS Cloud Map or the internal ALB
+    - Secrets (database credentials, API keys) are stored in AWS Secrets Manager and injected as environment variables at runtime
+    - Auto-scaling rules in CloudFormation scale each service's task count independently based on CPU/memory metrics
+    - CloudWatch collects logs from every container via the `awslogs` log driver
+  </Accordion>
+  <Accordion title="Staging environment">
+    Staging mirrors production but runs in a separate AWS account or VPC. The same CloudFormation templates deploy to staging with different parameter values (smaller instance sizes, separate database). Use staging to validate a service before promoting to production.
+  </Accordion>
+</AccordionGroup>
+
+## Adding a new service
+
+<Steps>
+  <Step title="Create the service directory">
+    ```bash
+    mkdir -p microservices/my-service/src
+    ```
+  </Step>
+  <Step title="Initialize a Node.js project">
+    ```bash
+    # Inside microservices/my-service/
+    npm init -y
+    npm install express
+    ```
+  </Step>
+  <Step title="Add a Dockerfile">
+    Follow the same multi-stage Dockerfile pattern used by the existing services: a `builder` stage that compiles TypeScript, and a lean `runner` stage that copies only the compiled output.
+  </Step>
+  <Step title="Register in Docker Compose">
+    Add a service block in `docker-compose.yml` so the new service starts alongside the others during local development.
+  </Step>
+  <Step title="Add a CloudFormation task definition">
+    Create or update a CloudFormation template in `infraestructure/cloudformation/` to define the ECS task definition and service for production deployment.
+  </Step>
+</Steps>

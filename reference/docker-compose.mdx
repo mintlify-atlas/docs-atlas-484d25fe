@@ -1,0 +1,256 @@
+---
+title: "Docker Compose configuration reference for Lightpress"
+description: "Reference for the Lightpress docker-compose.yml: services, ports, volumes, networks, environment variables, and common commands for local development."
+---
+
+Lightpress uses Docker Compose to orchestrate all services locally in a single command. Rather than running each microservice and the client in separate terminals with different dependency versions, `docker compose up` brings up the full stack — client, microservices, and supporting infrastructure like the database — in isolated containers that mirror the production environment.
+
+<Note>
+  You need Docker Engine 24+ and the Compose plugin (or Docker Desktop 4.x+) installed. Check your versions with `docker --version` and `docker compose version`.
+</Note>
+
+## File structure
+
+The `docker-compose.yml` at the project root defines all services. Here is a representative configuration for Lightpress:
+
+```yaml docker-compose.yml
+version: "3.9"
+
+networks:
+  lightpress:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
+services:
+
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    networks:
+      - lightpress
+    environment:
+      POSTGRES_DB: lightpress_dev
+      POSTGRES_USER: lightpress
+      POSTGRES_PASSWORD: localpassword
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lightpress"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  auth-service:
+    build:
+      context: ./microservices/auth-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks:
+      - lightpress
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      SERVICE_NAME: auth-service
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: lightpress_dev
+      DB_USER: lightpress
+      DB_PASSWORD: localpassword
+      JWT_SECRET: local-dev-secret-do-not-use-in-prod
+      JWT_EXPIRY: 15m
+      REFRESH_TOKEN_SECRET: local-refresh-secret
+      REFRESH_TOKEN_EXPIRY: 7d
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./microservices/auth-service/src:/app/src
+
+  billing-service:
+    build:
+      context: ./microservices/billing-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks:
+      - lightpress
+    ports:
+      - "3002:3002"
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      SERVICE_NAME: billing-service
+      AUTH_SERVICE_URL: http://auth-service:3001
+      FEATURE_BILLING_ENABLED: "true"
+    depends_on:
+      - auth-service
+    volumes:
+      - ./microservices/billing-service/src:/app/src
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks:
+      - lightpress
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_AUTH_SERVICE_URL: http://localhost:3001
+      VITE_BILLING_SERVICE_URL: http://localhost:3002
+    depends_on:
+      - auth-service
+    volumes:
+      - ./client/src:/app/src
+      - ./client/public:/app/public
+```
+
+## Services
+
+Each top-level key under `services` becomes a named container. Lightpress defines the following services:
+
+<AccordionGroup>
+  <Accordion title="postgres" icon="database">
+    The shared PostgreSQL database used by services that require persistent relational storage. It uses a named volume (`postgres_data`) so your data survives container restarts. A `healthcheck` ensures other services only start once PostgreSQL is accepting connections.
+
+    In production, replace this container with Amazon RDS — the database is only included in Compose for local development convenience.
+  </Accordion>
+
+  <Accordion title="auth-service" icon="lock">
+    Handles user registration, login, token issuance, and token refresh. It depends on `postgres` with a `service_healthy` condition so it waits for the database to be ready before starting. The `src/` directory is bind-mounted so that source changes reload automatically when running with a file watcher (e.g. `nodemon`).
+  </Accordion>
+
+  <Accordion title="billing-service" icon="credit-card">
+    Manages subscription plans, payment processing, and invoice generation. It depends on `auth-service` to validate tokens on incoming requests. Connect it to your Stripe keys via environment variables.
+  </Accordion>
+
+  <Accordion title="client" icon="monitor">
+    The frontend application served by a development server (Vite by default). Bind mounts `src/` and `public/` for hot-module replacement during development. In production, build a static bundle and serve it from S3 + CloudFront rather than running this container.
+  </Accordion>
+</AccordionGroup>
+
+## Key configuration sections
+
+### Ports
+
+Port mappings use the `"host:container"` format. The host port is what you access in your browser; the container port is what the service listens on internally.
+
+```yaml
+ports:
+  - "5432:5432"   # postgres — host 5432 → container 5432
+  - "3001:3001"   # auth-service
+  - "3002:3002"   # billing-service
+  - "5173:5173"   # client dev server
+```
+
+<Tip>
+  If a port is already in use on your machine, change only the host side (the left number). For example, `"5433:5432"` exposes PostgreSQL on host port 5433 while the container still uses 5432.
+</Tip>
+
+### Volumes
+
+Lightpress uses two types of volumes:
+
+| Type | Example | Purpose |
+|------|---------|---------|
+| Named volume | `postgres_data:/var/lib/postgresql/data` | Persist database data across `docker compose down` restarts |
+| Bind mount | `./microservices/auth-service/src:/app/src` | Sync local source files into the container for live reload |
+
+<Warning>
+  Bind mounts rely on your local file system. On Windows, large bind mounts can cause significant I/O slowness. Consider using Docker volumes with a sync tool if you experience performance issues.
+</Warning>
+
+### Networks
+
+All services share a single `bridge` network named `lightpress`. This allows containers to address each other by service name (e.g. `http://auth-service:3001`) rather than by IP address.
+
+```yaml
+networks:
+  lightpress:
+    driver: bridge
+```
+
+Services that should not communicate directly should be placed on separate networks. Add a second network and assign only the relevant services to it.
+
+### `depends_on`
+
+`depends_on` controls startup order. By default it only waits for the container to start, not for the application inside to be ready. Use `condition: service_healthy` together with a `healthcheck` definition to wait for genuine readiness:
+
+```yaml
+depends_on:
+  postgres:
+    condition: service_healthy
+```
+
+## Common commands
+
+<CodeGroup>
+
+```bash Start all services
+# Build images and start all containers in detached mode
+docker compose up --build -d
+```
+
+```bash Stop all services
+# Stop and remove containers, networks (volumes are preserved)
+docker compose down
+
+# Also remove named volumes (deletes database data)
+docker compose down -v
+```
+
+```bash View logs
+# Stream logs from all services
+docker compose logs -f
+
+# Stream logs from a specific service
+docker compose logs -f auth-service
+```
+
+```bash Run a command inside a container
+# Open a shell in the auth-service container
+docker compose exec auth-service sh
+
+# Run a one-off database migration
+docker compose exec auth-service npm run migrate
+```
+
+```bash Check service status
+# List all containers and their status
+docker compose ps
+```
+
+```bash Restart a single service
+# Rebuild and restart only the billing-service
+docker compose up --build -d billing-service
+```
+
+</CodeGroup>
+
+## Adding a new microservice
+
+When you add a new service to Lightpress, register it in `docker-compose.yml` following the same pattern as the existing microservices:
+
+<Steps>
+  <Step title="Add a service block">
+    Copy an existing service block (e.g. `billing-service`) and update the `context`, port, `SERVICE_NAME`, and any service-specific environment variables.
+  </Step>
+  <Step title="Connect it to the network">
+    Add `networks: - lightpress` to ensure it can communicate with other services by name.
+  </Step>
+  <Step title="Add dependencies">
+    If your service requires the database or depends on another service being ready first, add a `depends_on` block with the appropriate condition.
+  </Step>
+  <Step title="Expose the port">
+    Add a `ports` entry so you can call the service directly from your browser or API client during development.
+  </Step>
+  <Step title="Register the URL">
+    Add the new service's URL to the environment variables of any service that needs to call it, and document the new variable in your `.env.example`.
+  </Step>
+</Steps>

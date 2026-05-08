@@ -1,0 +1,292 @@
+---
+title: "Contributor guide: branches, commits, and reviews"
+description: "How to contribute to Lightpress: development setup, branching strategy, commit conventions, code style, testing, and the pull request review process."
+---
+
+Lightpress is a team project, and keeping the codebase consistent makes everyone's life easier. This guide covers everything you need to go from a fresh clone to an open pull request: how the repository is organized, how to set up your local environment, how to name branches and write commits, and what the review process looks like.
+
+<Note>
+  Before you start working on something non-trivial, open an issue or discuss it in the relevant channel first. This avoids duplicated effort and makes the review process smoother.
+</Note>
+
+## Project structure overview
+
+Understanding where things live is the first step to contributing effectively.
+
+```
+Lightpress/
+├── client/                        # Frontend application
+│   ├── src/
+│   ├── Dockerfile
+│   └── package.json
+├── microservices/                 # Backend services (one directory per service)
+│   ├── auth-service/
+│   │   ├── src/
+│   │   ├── Dockerfile
+│   │   └── package.json
+│   └── billing-service/
+│       └── ...
+├── infraestructure/
+│   └── cloudformation/            # AWS infrastructure templates
+├── scripts/
+│   ├── bash/                      # Shell automation scripts
+│   └── python/                    # Python automation scripts
+├── docker-compose.yml
+├── buildspec.yml
+└── .env.example
+```
+
+- **`client/`** — Frontend application. Single deployable unit served from S3 + CloudFront in production.
+- **`microservices/`** — Each subdirectory is a self-contained Node.js service with its own `package.json`, `Dockerfile`, and test suite. Services communicate over HTTP.
+- **`infraestructure/cloudformation/`** — AWS CloudFormation templates for provisioning all infrastructure. Changes here affect production resources directly.
+- **`scripts/bash/`** — Shell scripts for operational tasks: database seeding, log tailing, environment bootstrapping.
+- **`scripts/python/`** — Python scripts for data processing, reporting, and automation tasks.
+- **`docker-compose.yml`** — Local development orchestration. See the [Docker Compose reference](/reference/docker-compose) for details.
+- **`buildspec.yml`** — AWS CodeBuild pipeline configuration. See the [Buildspec reference](/reference/buildspec) for details.
+
+## Development setup
+
+<Steps>
+  <Step title="Prerequisites">
+    Ensure you have the following installed before cloning:
+
+    - **Node.js 20+** — `node --version`
+    - **npm 10+** — `npm --version`
+    - **Python 3.11+** — `python3 --version`
+    - **Docker Engine 24+** with the Compose plugin — `docker compose version`
+    - **AWS CLI v2** — `aws --version` (required for infrastructure work)
+
+    Optionally install **nvm** to manage Node.js versions and **pyenv** to manage Python versions.
+  </Step>
+  <Step title="Clone and install dependencies">
+    ```bash
+    git clone https://github.com/reds-skywalker/Lightpress.git
+    cd Lightpress
+
+    # Install client dependencies
+    cd client && npm install && cd ..
+
+    # Install each microservice's dependencies
+    for dir in microservices/*/; do (cd "$dir" && npm install); done
+
+    # Install Python dependencies (if working on scripts)
+    pip install -r scripts/python/requirements.txt
+    ```
+  </Step>
+  <Step title="Configure environment variables">
+    ```bash
+    cp .env.example .env
+    # Open .env and fill in the required values
+    ```
+
+    See the [Environment variables reference](/reference/environment-variables) for a description of every variable.
+  </Step>
+  <Step title="Start the local stack">
+    ```bash
+    docker compose up --build
+    ```
+
+    The client is available at `http://localhost:5173` and the auth service at `http://localhost:3001`. Check `docker compose ps` to confirm all containers are healthy.
+  </Step>
+  <Step title="Verify your setup">
+    ```bash
+    # Run unit tests across all services
+    for dir in microservices/*/; do (cd "$dir" && npm test); done
+
+    # Run client tests
+    cd client && npm test
+    ```
+
+    All tests should pass on a fresh checkout. If anything fails, check the open issues or ask in the team chat before proceeding.
+  </Step>
+</Steps>
+
+## Branching strategy
+
+Lightpress follows a structured branching model. All branches are created from `main` and merged back into `main` via pull request.
+
+| Prefix | When to use | Example |
+|--------|-------------|---------|
+| `feature/` | New functionality or significant enhancements | `feature/add-webhook-service` |
+| `bugfix/` | Non-critical bug fixes | `bugfix/fix-token-expiry-calc` |
+| `hotfix/` | Urgent production fixes that cannot wait for a normal release | `hotfix/fix-login-500-error` |
+| `chore/` | Dependency updates, tooling changes, refactors with no behavior change | `chore/upgrade-node-20` |
+| `docs/` | Documentation-only changes | `docs/update-contributing-guide` |
+
+<Tip>
+  Keep branch names lowercase, hyphenated, and descriptive. A reviewer should be able to understand the scope of a branch from its name alone.
+</Tip>
+
+```bash
+# Create a new feature branch from an up-to-date main
+git checkout main
+git pull origin main
+git checkout -b feature/your-feature-name
+```
+
+## Commit message conventions
+
+Lightpress follows [Conventional Commits](https://www.conventionalcommits.org/). Every commit message must follow this format:
+
+```
+<type>(<scope>): <short summary>
+
+[optional body]
+
+[optional footer: BREAKING CHANGE or issue reference]
+```
+
+**Types:**
+
+| Type | When to use |
+|------|-------------|
+| `feat` | A new feature visible to users or other services |
+| `fix` | A bug fix |
+| `refactor` | Code change with no behavior change |
+| `test` | Adding or updating tests |
+| `docs` | Documentation changes only |
+| `chore` | Build system, dependency updates, tooling |
+| `ci` | Changes to CI/CD configuration (`buildspec.yml`, CodeBuild settings) |
+| `perf` | Performance improvements |
+
+**Scope** is the affected service or directory: `auth-service`, `billing-service`, `client`, `cloudformation`, `scripts`, `docker`, etc.
+
+```bash
+# Examples of well-formed commit messages
+feat(auth-service): add refresh token rotation on every use
+fix(billing-service): handle Stripe webhook signature verification failure
+chore(client): upgrade Vite to 5.2
+ci: add ECR image scan step to buildspec
+docs(contributing): update branching strategy section
+```
+
+<Warning>
+  Avoid vague commit messages like `fix stuff`, `update`, or `WIP`. Each commit should be a coherent unit of work that can be understood in isolation from its diff.
+</Warning>
+
+## Pull request process
+
+<Steps>
+  <Step title="Keep your branch up to date">
+    Before opening a PR, rebase onto the latest `main` to avoid merge conflicts:
+
+    ```bash
+    git fetch origin
+    git rebase origin/main
+    ```
+  </Step>
+  <Step title="Self-review your diff">
+    Read through your own changes as if you were a reviewer. Remove debug logs, commented-out code, and unrelated changes. Confirm that tests cover the new behavior.
+  </Step>
+  <Step title="Open the pull request">
+    Push your branch and open a PR against `main`. Fill in the PR template:
+
+    - **Summary** — What does this change do and why?
+    - **Testing** — How did you verify it works?
+    - **Breaking changes** — Does this change any public API contract or environment variable?
+    - **Related issues** — Link to any relevant GitHub issues.
+  </Step>
+  <Step title="Address review feedback">
+    Push additional commits to your branch to address reviewer comments. Do not force-push after a review has started — it makes it harder for reviewers to see what changed.
+  </Step>
+  <Step title="Merge">
+    Once the PR is approved and CI passes, use **Squash and merge** to keep the `main` history linear. The squash commit message should follow the Conventional Commits format.
+  </Step>
+</Steps>
+
+## Code style
+
+### Node.js services and client (ESLint + Prettier)
+
+All JavaScript and TypeScript code is formatted with Prettier and linted with ESLint. Configuration files live at the root of each service.
+
+```bash
+# Check for lint errors
+npm run lint
+
+# Auto-fix lint errors and format code
+npm run lint:fix
+
+# Format files with Prettier only
+npm run format
+```
+
+Key style rules enforced across all services:
+
+- 2-space indentation
+- Single quotes for strings
+- Trailing commas in multi-line structures
+- No unused variables (`no-unused-vars` as error)
+- Explicit return types on exported functions (TypeScript)
+- No `console.log` in production code — use the structured logger instead
+
+### Python scripts (Black + flake8)
+
+Python code in `scripts/python/` is formatted with Black and checked with flake8.
+
+```bash
+# Format all Python files
+black scripts/python/
+
+# Run flake8 linter
+flake8 scripts/python/
+
+# Run both (useful in pre-commit hooks)
+black --check scripts/python/ && flake8 scripts/python/
+```
+
+Python code follows PEP 8 with a maximum line length of 88 characters (Black's default).
+
+<Info>
+  A `.pre-commit-config.yaml` is provided in the repository. Install the hooks with `pre-commit install` to have formatting and linting run automatically before every commit.
+</Info>
+
+## Running tests
+
+### Unit tests
+
+Each microservice and the client has its own test suite using Jest (Node.js) or pytest (Python).
+
+```bash
+# Run tests for a single service
+cd microservices/auth-service
+npm test
+
+# Run tests with coverage
+npm test -- --coverage
+
+# Run tests in watch mode during development
+npm test -- --watch
+```
+
+```bash
+# Run Python tests
+pytest scripts/python/tests/
+
+# Run with coverage
+pytest --cov=scripts/python scripts/python/tests/
+```
+
+### Integration tests
+
+Integration tests bring up a subset of the stack and exercise services through their HTTP APIs. They are slower than unit tests and are not required to pass locally, but they run in CI on every PR.
+
+```bash
+# Start the test environment
+docker compose -f docker-compose.test.yml up -d
+
+# Run integration tests
+npm run test:integration
+
+# Tear down the test environment
+docker compose -f docker-compose.test.yml down
+```
+
+### CI requirements
+
+The CodeBuild pipeline requires the following to pass before a PR can be merged:
+
+- All unit tests pass with zero failures
+- Code coverage does not fall below the threshold defined in each service's `jest.config.js`
+- ESLint and flake8 report zero errors (warnings are allowed but should be addressed)
+- Docker images build without errors

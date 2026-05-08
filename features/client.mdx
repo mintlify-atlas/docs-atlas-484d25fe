@@ -1,0 +1,174 @@
+---
+title: "Frontend client: building the Lightpress UI layer"
+description: "The client/ directory is the Lightpress frontend: a Node.js web app that communicates with microservices over HTTP and deploys to AWS S3 and CloudFront."
+---
+
+The `client/` directory contains the user-facing web application for Lightpress. It is a standalone Node.js frontend project that connects to your microservices over HTTP, handles authentication flows, and delivers the interface your end users interact with. Because it is decoupled from the backend, you can iterate on the UI without touching any service logic, and deploy it independently to a CDN or container host.
+
+## Directory structure
+
+```
+client/
+├── src/
+│   ├── components/    # Reusable UI components
+│   ├── pages/         # Page-level components / routes
+│   └── services/      # HTTP API call wrappers
+├── package.json
+├── .env.example
+└── Dockerfile
+```
+
+The `services/` layer inside the client is where API calls to each microservice are organized. Keep HTTP logic here rather than scattering `fetch` calls across components — it makes it straightforward to swap base URLs between local and production environments.
+
+## Tech stack
+
+Lightpress uses a JavaScript/TypeScript frontend. The `.gitignore` excludes `node_modules`, `dist`, and `build`, which matches the output conventions of the major React-based frameworks.
+
+<Tabs>
+  <Tab title="Next.js (recommended)">
+    Next.js is the natural fit for a SaaS product on AWS. It supports server-side rendering for fast initial loads, API routes you can proxy through to microservices, and static export for CDN delivery.
+
+    ```bash
+    # Inside client/
+    npm install
+    npm run dev
+    ```
+
+    The development server starts at `http://localhost:3000` by default.
+  </Tab>
+  <Tab title="React (Vite)">
+    A plain Vite + React setup works well if you prefer a lighter build tool and are comfortable managing routing yourself with React Router.
+
+    ```bash
+    # Inside client/
+    npm install
+    npm run dev
+    ```
+
+    Vite's dev server starts at `http://localhost:5173` by default.
+  </Tab>
+  <Tab title="Vue / Nuxt">
+    If your team prefers Vue, the `client/` directory structure supports it without changes. Nuxt provides a similar feature set to Next.js for SSR and static generation.
+
+    ```bash
+    # Inside client/
+    npm install
+    npm run dev
+    ```
+  </Tab>
+</Tabs>
+
+## Connecting to microservices
+
+The client talks to the microservices backend over HTTP/HTTPS. In local development, each service exposes a port via Docker Compose. In production, requests go through an Application Load Balancer (ALB) that routes to each service by path prefix.
+
+<CodeGroup>
+
+```typescript services/api.ts
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+
+export async function getUser(id: string) {
+  const res = await fetch(`${BASE_URL}/users/${id}`, {
+    headers: { Authorization: `Bearer ${getToken()}` },
+  });
+  if (!res.ok) throw new Error(`Failed to fetch user: ${res.status}`);
+  return res.json();
+}
+```
+
+```bash .env.local (development)
+NEXT_PUBLIC_API_URL=http://localhost:4000
+```
+
+```bash .env.production
+NEXT_PUBLIC_API_URL=https://api.yourdomain.com
+```
+
+</CodeGroup>
+
+<Note>
+  Never hard-code service URLs in component files. Always read from environment variables so the same build artefact can target different environments without modification.
+</Note>
+
+## Local development workflow
+
+<Steps>
+  <Step title="Start all services with Docker Compose">
+    From the repository root, bring up the full stack. This starts the client dev server alongside every microservice.
+
+    ```bash
+    docker compose up --build
+    ```
+  </Step>
+  <Step title="Or run the client standalone">
+    If you only need to work on the UI and the backend services are already running (or you are mocking them), start just the client.
+
+    ```bash
+    # Inside client/
+    npm install
+    npm run dev
+    ```
+  </Step>
+  <Step title="Set environment variables">
+    Copy the example env file and point `NEXT_PUBLIC_API_URL` at your local or remote microservices.
+
+    ```bash
+    cp .env.example .env.local
+    # Edit .env.local
+    ```
+  </Step>
+  <Step title="Verify service connections">
+    Open the running app in your browser and confirm that data loads from the backend. Check the browser network tab — requests should resolve to your local service ports.
+  </Step>
+</Steps>
+
+## Building for production
+
+<Tabs>
+  <Tab title="Docker">
+    The `client/Dockerfile` produces an optimized production image. The Docker Compose file and CodeBuild pipeline use this same image.
+
+    ```bash
+    docker build -t lightpress-client ./client
+    docker run -p 3000:3000 \
+      -e NEXT_PUBLIC_API_URL=https://api.yourdomain.com \
+      lightpress-client
+    ```
+  </Tab>
+  <Tab title="Static export">
+    If you are deploying to S3 + CloudFront, export the client as static HTML.
+
+    ```bash
+    # Inside client/
+    npm run build
+    # Outputs to client/out/ or client/dist/
+    ```
+
+    Upload the output directory to your S3 bucket and set the CloudFront distribution's origin to that bucket.
+  </Tab>
+</Tabs>
+
+<Warning>
+  The `dist/` and `build/` directories are in `.gitignore` and are never committed. Always build artefacts in CI (via `buildspec.yml`) rather than committing compiled output.
+</Warning>
+
+## Environment variables
+
+<AccordionGroup>
+  <Accordion title="Required variables">
+    | Variable | Description |
+    |---|---|
+    | `NEXT_PUBLIC_API_URL` | Base URL for microservices API (ALB URL in production) |
+    | `NEXT_PUBLIC_APP_ENV` | Current environment: `development`, `staging`, or `production` |
+  </Accordion>
+  <Accordion title="Optional variables">
+    | Variable | Description |
+    |---|---|
+    | `NEXT_PUBLIC_AUTH_URL` | Override for the authentication service endpoint |
+    | `NEXT_PUBLIC_SENTRY_DSN` | Sentry DSN for frontend error tracking |
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  Keep a `.env.example` file in `client/` committed to the repository with all variable names but no values. New developers copy this file to `.env.local` as part of onboarding.
+</Tip>

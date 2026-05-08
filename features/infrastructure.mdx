@@ -1,0 +1,229 @@
+---
+title: "AWS Infrastructure: CloudFormation & IaC in Lightpress"
+description: "Lightpress manages AWS infrastructure as code in infraestructure/cloudformation/. Learn how CloudFormation templates provision VPCs, ECS, RDS, S3, and more."
+---
+
+Lightpress manages all of its AWS infrastructure as code using AWS CloudFormation. Every resource the platform depends on — VPCs, load balancers, ECS clusters, RDS databases, S3 buckets — is declared in YAML templates stored in `infraestructure/cloudformation/`. This means your infrastructure is reproducible, version-controlled, and reviewable in pull requests just like application code.
+
+<Note>
+  The directory name is spelled `infraestructure/` (matching the repository). This is intentional — keep this spelling consistent when referencing the path in scripts, CI pipelines, and documentation to avoid broken references.
+</Note>
+
+## Directory structure
+
+```
+infraestructure/
+└── cloudformation/
+    ├── network.yml        # VPC, subnets, security groups
+    ├── ecs-cluster.yml    # ECS cluster and ECR repositories
+    ├── services.yml       # ECS task definitions and services
+    ├── database.yml       # RDS instance and parameter groups
+    ├── storage.yml        # S3 buckets
+    ├── alb.yml            # Application Load Balancers
+    └── cicd.yml           # CodeBuild and CodePipeline resources
+```
+
+Splitting templates by concern (networking, compute, data) keeps each file focused and allows you to update one layer — for example, scaling the ECS cluster — without risking changes to database configuration.
+
+## What CloudFormation manages
+
+CloudFormation templates in Lightpress define the following resource categories:
+
+<AccordionGroup>
+  <Accordion title="Networking (VPC, subnets, security groups)">
+    The `network.yml` template creates:
+
+    - A VPC with public and private subnets across two or three Availability Zones
+    - An Internet Gateway and NAT Gateways for outbound traffic from private subnets
+    - Security groups that enforce least-privilege access between tiers (ALB → ECS → RDS)
+    - VPC endpoints for S3 and other AWS services to avoid traffic traversing the public internet
+
+    All microservices run in private subnets. Only the ALB is in the public subnet.
+  </Accordion>
+  <Accordion title="Compute (ECS, ECR)">
+    The `ecs-cluster.yml` and `services.yml` templates define:
+
+    - An ECS cluster (Fargate launch type — no EC2 instances to manage)
+    - Task definitions for each microservice, including CPU/memory limits, container image URIs from ECR, environment variable injection from Secrets Manager, and the `awslogs` log configuration
+    - ECS services with desired task counts and auto-scaling policies
+    - ECR repositories where Docker images are pushed by the CI pipeline
+
+    ```yaml
+    # Excerpt: ECS task definition resource in services.yml
+    AuthServiceTaskDefinition:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: lightpress-auth
+        NetworkMode: awsvpc
+        RequiresCompatibilities: [FARGATE]
+        Cpu: "256"
+        Memory: "512"
+        ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+        ContainerDefinitions:
+          - Name: auth-service
+            Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/lightpress-auth:latest"
+            PortMappings:
+              - ContainerPort: 3000
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: /lightpress/auth
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: ecs
+    ```
+  </Accordion>
+  <Accordion title="Database (RDS)">
+    The `database.yml` template provisions:
+
+    - An Amazon RDS instance (PostgreSQL) in a private subnet group
+    - A Multi-AZ standby for production environments
+    - Automated backups with a configurable retention period
+    - A Secrets Manager secret for the database credentials, rotated automatically
+
+    The database endpoint is passed to microservices via environment variables injected at ECS task launch time.
+  </Accordion>
+  <Accordion title="Storage (S3)">
+    The `storage.yml` template creates S3 buckets for:
+
+    - Application file uploads (user avatars, documents)
+    - CloudFront origin for the static client build
+    - CodeBuild artefact storage for the CI/CD pipeline
+
+    Bucket policies enforce that only the relevant ECS task roles or CloudFront distributions can read each bucket.
+  </Accordion>
+  <Accordion title="Load balancing (ALB)">
+    The `alb.yml` template defines:
+
+    - An Application Load Balancer in the public subnets
+    - HTTPS listener with an ACM certificate
+    - Listener rules that route traffic to each microservice by path prefix (e.g., `/auth/*` → auth service, `/users/*` → users service)
+    - A separate internal ALB for service-to-service traffic that never leaves the VPC
+  </Accordion>
+  <Accordion title="CI/CD pipeline (CodeBuild, CodePipeline)">
+    The `cicd.yml` template provisions the build pipeline. The `buildspec.yml` in the repository root defines the build steps that CodeBuild executes. Together they automate image builds, ECR pushes, and ECS deployments on every merge to `main`.
+  </Accordion>
+</AccordionGroup>
+
+## Infrastructure as code workflow
+
+<Steps>
+  <Step title="Edit a template">
+    Make changes to the relevant YAML file in `infraestructure/cloudformation/`. Use CloudFormation's `Ref` and `!Sub` intrinsic functions to reference other resources rather than hard-coding IDs or ARNs.
+  </Step>
+  <Step title="Validate the template">
+    Before deploying, validate the template syntax with the AWS CLI.
+
+    ```bash
+    aws cloudformation validate-template \
+      --template-body file://infraestructure/cloudformation/ecs-cluster.yml
+    ```
+  </Step>
+  <Step title="Preview changes with a change set">
+    Create a change set to see exactly which resources will be added, modified, or replaced before you apply anything.
+
+    ```bash
+    aws cloudformation create-change-set \
+      --stack-name lightpress-prod-ecs \
+      --change-set-name preview-$(date +%s) \
+      --template-body file://infraestructure/cloudformation/ecs-cluster.yml \
+      --parameters ParameterKey=Environment,ParameterValue=prod \
+      --capabilities CAPABILITY_NAMED_IAM
+
+    aws cloudformation describe-change-set \
+      --stack-name lightpress-prod-ecs \
+      --change-set-name preview-<timestamp>
+    ```
+  </Step>
+  <Step title="Deploy the stack">
+    Apply the change set, or use `deploy` for a combined create-or-update operation.
+
+    ```bash
+    aws cloudformation deploy \
+      --stack-name lightpress-prod-ecs \
+      --template-file infraestructure/cloudformation/ecs-cluster.yml \
+      --parameter-overrides Environment=prod \
+      --capabilities CAPABILITY_NAMED_IAM
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Resources marked `UpdateReplacePolicy: Retain` or `DeletionPolicy: Retain` (such as RDS instances and S3 buckets) will not be deleted when a stack is torn down. This protects production data, but means you must clean up these resources manually when decommissioning an environment.
+</Warning>
+
+## Environments
+
+Lightpress supports three environments. Each environment is a separate set of CloudFormation stacks, deployed with different parameter values.
+
+<CardGroup cols={3}>
+  <Card title="Development" icon="laptop">
+    Runs locally via Docker Compose. No AWS infrastructure is required unless you are testing AWS-specific integrations (SQS, S3, etc.) — use LocalStack for those.
+  </Card>
+  <Card title="Staging" icon="flask">
+    A full AWS deployment using the same CloudFormation templates as production, but with smaller instance sizes and a `staging` parameter prefix. Deploy here first to validate infrastructure changes.
+  </Card>
+  <Card title="Production" icon="globe">
+    Multi-AZ, auto-scaling, with RDS Multi-AZ enabled and CloudWatch alarms configured. Only promoted artefacts from the staging pipeline reach production.
+  </Card>
+</CardGroup>
+
+To deploy to a specific environment, pass the `Environment` parameter to the CloudFormation deploy command:
+
+<CodeGroup>
+
+```bash staging
+aws cloudformation deploy \
+  --stack-name lightpress-staging-network \
+  --template-file infraestructure/cloudformation/network.yml \
+  --parameter-overrides Environment=staging \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+```bash production
+aws cloudformation deploy \
+  --stack-name lightpress-prod-network \
+  --template-file infraestructure/cloudformation/network.yml \
+  --parameter-overrides Environment=prod \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+</CodeGroup>
+
+## Useful AWS CLI commands
+
+<AccordionGroup>
+  <Accordion title="List all Lightpress stacks">
+    ```bash
+    aws cloudformation list-stacks \
+      --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+      --query "StackSummaries[?starts_with(StackName, 'lightpress')]"
+    ```
+  </Accordion>
+  <Accordion title="Describe stack events (for debugging a failed deploy)">
+    ```bash
+    aws cloudformation describe-stack-events \
+      --stack-name lightpress-prod-ecs \
+      --query "StackEvents[?ResourceStatus=='CREATE_FAILED' || ResourceStatus=='UPDATE_FAILED']"
+    ```
+  </Accordion>
+  <Accordion title="Get a stack output (e.g., ALB DNS name)">
+    ```bash
+    aws cloudformation describe-stacks \
+      --stack-name lightpress-prod-alb \
+      --query "Stacks[0].Outputs[?OutputKey=='ALBDnsName'].OutputValue" \
+      --output text
+    ```
+  </Accordion>
+  <Accordion title="Delete a staging stack">
+    ```bash
+    aws cloudformation delete-stack \
+      --stack-name lightpress-staging-ecs
+    ```
+
+    Stacks with `DeletionPolicy: Retain` on critical resources will leave those resources in place after stack deletion.
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  Store your CloudFormation parameter files (e.g., `params-staging.json`, `params-prod.json`) in `infraestructure/cloudformation/` alongside the templates. This makes it easy to reproduce any environment's exact configuration and review parameter changes in pull requests.
+</Tip>

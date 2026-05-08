@@ -1,0 +1,218 @@
+---
+title: "Run Lightpress locally using Docker Compose"
+description: "Run all Lightpress services on your local machine using Docker Compose, with coverage of the Compose file, environment variables, logs, and image rebuilds."
+---
+
+Docker Compose is the recommended way to run Lightpress locally. It starts all services — the frontend client and every microservice — in a single command, wiring them together on a shared Docker network so they can communicate as they would in production. You do not need an AWS account for local development; everything runs on your machine inside Docker containers.
+
+## Prerequisites
+
+Install the following tools before running Lightpress locally:
+
+- **Docker Desktop** 4.x or later — includes the Docker Engine and the `docker compose` CLI ([download](https://www.docker.com/products/docker-desktop/))
+- **Git** — to clone the repository
+- A text editor to modify `.env`
+
+<Note>
+  Lightpress uses the `docker compose` CLI (V2, built into Docker Desktop) rather than the legacy `docker-compose` binary. If you are on an older system, upgrade to Docker Desktop 4.x or install the Compose plugin separately.
+</Note>
+
+## Environment variables
+
+Lightpress reads configuration from a `.env` file in the repository root. This file is excluded from version control by `.gitignore`.
+
+<Steps>
+  <Step title="Copy the example file">
+    ```bash
+    cp .env.example .env
+    ```
+  </Step>
+  <Step title="Fill in your values">
+    Open `.env` in your editor and set the required values. At minimum you need database credentials and any API keys consumed by your microservices.
+
+    ```bash
+    # Example .env entries
+    NODE_ENV=development
+    PORT=3000
+    DB_HOST=db
+    DB_PORT=5432
+    DB_NAME=lightpress
+    DB_USER=lightpress
+    DB_PASSWORD=change_me
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Never commit your `.env` file or any file containing real credentials. Add additional secret files to `.gitignore` before creating commits.
+</Warning>
+
+## Docker Compose file structure
+
+The `docker-compose.yml` at the repository root defines one service per application component. A typical Lightpress Compose configuration includes services for the client, each microservice, and supporting infrastructure such as a database.
+
+```yaml docker-compose.yml
+version: "3.9"
+
+services:
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: ./microservices/api
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  db_data:
+```
+
+Each `build.context` points to the directory containing the service's `Dockerfile`. The `env_file` directive injects your `.env` variables into the container at runtime.
+
+## Starting services
+
+<Steps>
+  <Step title="Build images and start all services">
+    Run this command from the repository root. The `--build` flag ensures Docker builds fresh images before starting containers, picking up any code changes since the last run.
+
+    ```bash
+    docker compose up --build
+    ```
+
+    To run services in the background (detached mode), add the `-d` flag:
+
+    ```bash
+    docker compose up --build -d
+    ```
+  </Step>
+  <Step title="Verify services are running">
+    Check that all containers started successfully:
+
+    ```bash
+    docker compose ps
+    ```
+
+    You should see each service with a `running` status.
+  </Step>
+  <Step title="Open the application">
+    By default, the client is available at `http://localhost:3000`. Adjust the port if your Compose file maps it differently.
+  </Step>
+</Steps>
+
+## Stopping services
+
+<CodeGroup>
+
+```bash Stop and keep volumes
+docker compose down
+```
+
+```bash Stop and remove volumes
+docker compose down -v
+```
+
+```bash Stop without removing containers
+docker compose stop
+```
+
+</CodeGroup>
+
+Use `down -v` when you want a completely clean state — for example, to reset the database to its initial empty state. Omit `-v` when you want to preserve data between sessions.
+
+## Viewing logs
+
+<CodeGroup>
+
+```bash Stream all service logs
+docker compose logs -f
+```
+
+```bash Stream logs for one service
+docker compose logs -f api
+```
+
+```bash Show last 100 lines for a service
+docker compose logs --tail=100 client
+```
+
+</CodeGroup>
+
+## Rebuilding images
+
+When you change a `Dockerfile` or add a new dependency, rebuild the affected image before restarting:
+
+<CodeGroup>
+
+```bash Rebuild all images
+docker compose build
+```
+
+```bash Rebuild one service
+docker compose build api
+```
+
+```bash Rebuild without cache
+docker compose build --no-cache api
+```
+
+</CodeGroup>
+
+After rebuilding, restart the service to use the new image:
+
+```bash
+docker compose up -d api
+```
+
+## Running commands inside a container
+
+To open a shell in a running container or run a one-off command, use `docker compose exec`:
+
+```bash
+# Open a shell in the api service
+docker compose exec api sh
+
+# Run a database migration inside the api container
+docker compose exec api npm run migrate
+```
+
+## Common issues
+
+<AccordionGroup>
+  <Accordion title="Port already in use">
+    If a port is already bound on your host, Docker will refuse to start the conflicting service. Either stop the process occupying the port or change the host port mapping in `docker-compose.yml` (e.g., change `"3000:3000"` to `"3001:3000"`).
+  </Accordion>
+  <Accordion title="Environment variables not loading">
+    Confirm that your `.env` file is in the repository root (the same directory as `docker-compose.yml`) and that the variable names match exactly. Docker Compose is case-sensitive.
+  </Accordion>
+  <Accordion title="Stale build cache causing unexpected behaviour">
+    Run `docker compose build --no-cache` to force a full rebuild, then `docker compose up -d` to restart services with the fresh images.
+  </Accordion>
+  <Accordion title="Database connection refused on startup">
+    Services that depend on the database may start before the database is ready to accept connections. Add a health check to the `db` service and a `condition: service_healthy` dependency in your application service to control startup order.
+  </Accordion>
+</AccordionGroup>

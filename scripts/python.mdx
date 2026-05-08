@@ -1,0 +1,351 @@
+---
+title: "Python Automation Scripts for Lightpress on AWS"
+description: "Reference for Lightpress Python scripts: boto3 AWS SDK operations, data migration, reporting, and integration testing with virtual environment setup."
+---
+
+Python scripts in `scripts/python/` handle tasks that benefit from a full programming language: AWS SDK calls via `boto3`, structured data processing, database migrations, report generation, and integration tests that assert end-to-end behaviour. Python is the right choice when logic becomes complex enough that a shell script would be hard to read or test.
+
+## Environment setup
+
+Python scripts share a virtual environment and a single `requirements.txt` in `scripts/python/`. Set this up once on each machine where you intend to run them.
+
+<Steps>
+  <Step title="Create a virtual environment">
+    From the project root, create an isolated Python environment so script dependencies don't conflict with system packages.
+    ```bash
+    python3 -m venv scripts/python/.venv
+    ```
+  </Step>
+  <Step title="Activate the environment">
+    Activate the virtual environment before running or installing packages. You need to do this in every new terminal session.
+    <Tabs>
+      <Tab title="macOS / Linux">
+        ```bash
+        source scripts/python/.venv/bin/activate
+        ```
+      </Tab>
+      <Tab title="Windows">
+        ```powershell
+        scripts\python\.venv\Scripts\Activate.ps1
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+  <Step title="Install dependencies">
+    Install the packages declared in `requirements.txt`.
+    ```bash
+    pip install -r scripts/python/requirements.txt
+    ```
+  </Step>
+  <Step title="Verify your AWS credentials">
+    Scripts that use `boto3` pick up credentials from the standard AWS credential chain: environment variables, `~/.aws/credentials`, or an IAM instance profile.
+    ```bash
+    python3 -c "import boto3; print(boto3.client('sts').get_caller_identity()['Arn'])"
+    ```
+  </Step>
+</Steps>
+
+### requirements.txt
+
+```text requirements.txt
+boto3>=1.34
+botocore>=1.34
+psycopg2-binary>=2.9
+requests>=2.31
+python-dotenv>=1.0
+```
+
+<Note>
+  Add `scripts/python/.venv/` to your `.gitignore` if it is not already excluded. The virtual environment directory should never be committed to version control.
+</Note>
+
+## Running scripts
+
+With the virtual environment activated, run scripts from the project root:
+
+```bash
+python3 scripts/python/migrate.py
+python3 scripts/python/report.py --month 2024-03
+```
+
+Scripts that need AWS or database credentials read them from environment variables. Load your `.env` file before running:
+
+```bash
+set -a && source .env && set +a
+python3 scripts/python/rotate-secrets.py
+```
+
+## Script reference
+
+### migrate.py — data migration
+
+Connects to the application database and applies incremental data migrations that cannot be expressed as schema-only DDL. Each migration function is idempotent so the script can be run safely multiple times.
+
+```python migrate.py
+#!/usr/bin/env python3
+"""Apply incremental data migrations to the Lightpress database."""
+
+import os
+import sys
+import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_CONFIG = {
+    "host":     os.environ["DB_HOST"],
+    "dbname":   os.environ["DB_NAME"],
+    "user":     os.environ["DB_USER"],
+    "password": os.environ["DB_PASSWORD"],
+    "port":     int(os.getenv("DB_PORT", "5432")),
+}
+
+MIGRATIONS = []
+
+def migration(fn):
+    """Decorator to register a migration function."""
+    MIGRATIONS.append(fn)
+    return fn
+
+@migration
+def backfill_user_slugs(cursor):
+    """Populate missing slug values from existing display names."""
+    cursor.execute("""
+        UPDATE users
+        SET    slug = LOWER(REGEXP_REPLACE(display_name, '[^a-zA-Z0-9]+', '-', 'g'))
+        WHERE  slug IS NULL OR slug = ''
+    """)
+    print(f"  backfill_user_slugs: {cursor.rowcount} rows updated")
+
+@migration
+def normalize_plan_names(cursor):
+    """Standardise legacy plan name casing to lowercase."""
+    cursor.execute("""
+        UPDATE subscriptions
+        SET    plan = LOWER(plan)
+        WHERE  plan != LOWER(plan)
+    """)
+    print(f"  normalize_plan_names: {cursor.rowcount} rows updated")
+
+def main():
+    print(f"Connecting to {DB_CONFIG['host']}/{DB_CONFIG['dbname']}...")
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for fn in MIGRATIONS:
+                    print(f"Running {fn.__name__}...")
+                    fn(cur)
+        print("All migrations complete.")
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+### report.py — usage and billing report
+
+Queries DynamoDB and the application database to produce a monthly usage summary and writes it as a CSV. Pass `--month YYYY-MM` to select a reporting period; defaults to the previous calendar month.
+
+```python report.py
+#!/usr/bin/env python3
+"""Generate a monthly usage report from DynamoDB and the application database."""
+
+import argparse
+import csv
+import os
+import sys
+from datetime import date, timedelta
+import boto3
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def last_month() -> str:
+    first_of_this_month = date.today().replace(day=1)
+    last_month_end = first_of_this_month - timedelta(days=1)
+    return last_month_end.strftime("%Y-%m")
+
+def fetch_event_counts(dynamodb, table_name: str, month: str) -> dict[str, int]:
+    """Scan the events table for records in the given month."""
+    table = dynamodb.Table(table_name)
+    counts: dict[str, int] = {}
+    kwargs = {
+        "FilterExpression": "begins_with(#ts, :month)",
+        "ExpressionAttributeNames": {"#ts": "timestamp"},
+        "ExpressionAttributeValues": {":month": month},
+    }
+    while True:
+        response = table.scan(**kwargs)
+        for item in response.get("Items", []):
+            tenant = item.get("tenant_id", "unknown")
+            counts[tenant] = counts.get(tenant, 0) + 1
+        if "LastEvaluatedKey" not in response:
+            break
+        kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    return counts
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--month", default=last_month(), help="Month in YYYY-MM format")
+    args = parser.parse_args()
+
+    region = os.getenv("AWS_REGION", "us-east-1")
+    table_name = os.environ["DYNAMODB_EVENTS_TABLE"]
+    output_file = f"reports/usage-{args.month}.csv"
+
+    os.makedirs("reports", exist_ok=True)
+
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    counts = fetch_event_counts(dynamodb, table_name, args.month)
+
+    with open(output_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["tenant_id", "event_count", "month"])
+        for tenant_id, count in sorted(counts.items()):
+            writer.writerow([tenant_id, count, args.month])
+
+    print(f"Report written to {output_file} ({len(counts)} tenants)")
+
+if __name__ == "__main__":
+    main()
+```
+
+### rotate-secrets.py — AWS Secrets Manager rotation
+
+Generates new random credentials, updates the secret value in AWS Secrets Manager, and optionally triggers a rotation Lambda if one is configured for the secret. Use this as part of a scheduled maintenance window.
+
+```python rotate-secrets.py
+#!/usr/bin/env python3
+"""Rotate application secrets stored in AWS Secrets Manager."""
+
+import json
+import os
+import secrets
+import string
+import boto3
+from dotenv import load_dotenv
+
+load_dotenv()
+
+AWS_REGION   = os.getenv("AWS_REGION", "us-east-1")
+SECRET_NAMES = os.environ["SECRET_NAMES"].split(",")  # comma-separated list
+
+def generate_password(length: int = 32) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+def rotate_secret(client, secret_name: str) -> None:
+    print(f"Rotating: {secret_name}")
+
+    existing = json.loads(
+        client.get_secret_value(SecretId=secret_name)["SecretString"]
+    )
+
+    existing["password"] = generate_password()
+    existing["rotated_at"] = __import__("datetime").datetime.utcnow().isoformat()
+
+    client.put_secret_value(
+        SecretId=secret_name,
+        SecretString=json.dumps(existing),
+    )
+    print(f"  Updated {secret_name}")
+
+def main():
+    client = boto3.client("secretsmanager", region_name=AWS_REGION)
+    for name in SECRET_NAMES:
+        rotate_secret(client, name.strip())
+    print("Rotation complete.")
+
+if __name__ == "__main__":
+    main()
+```
+
+<Warning>
+  After rotating a secret, you must redeploy or restart any service that has the old credentials cached. Coordinate rotation with a deployment window to avoid authentication failures.
+</Warning>
+
+### integration_test.py — end-to-end integration tests
+
+Sends HTTP requests to the running application and asserts that critical user flows return the expected responses. Run this after a deployment as a smoke test.
+
+```python integration_test.py
+#!/usr/bin/env python3
+"""Post-deployment integration tests for the Lightpress API."""
+
+import os
+import sys
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_URL = os.environ["API_BASE_URL"].rstrip("/")
+API_KEY  = os.environ["API_KEY"]
+
+HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+
+PASS = 0
+FAIL = 0
+
+def test(name: str, condition: bool, detail: str = "") -> None:
+    global PASS, FAIL
+    if condition:
+        print(f"  PASS  {name}")
+        PASS += 1
+    else:
+        print(f"  FAIL  {name}" + (f" — {detail}" if detail else ""))
+        FAIL += 1
+
+def run_tests():
+    # Health check
+    r = requests.get(f"{BASE_URL}/health", timeout=10)
+    test("GET /health returns 200", r.status_code == 200)
+    test("health body contains status", "status" in r.json())
+
+    # Authentication
+    r = requests.get(f"{BASE_URL}/api/v1/me", headers=HEADERS, timeout=10)
+    test("GET /api/v1/me returns 200 with valid key", r.status_code == 200)
+
+    r = requests.get(f"{BASE_URL}/api/v1/me", timeout=10)
+    test("GET /api/v1/me returns 401 without key", r.status_code == 401)
+
+    # Data endpoint
+    r = requests.get(f"{BASE_URL}/api/v1/items", headers=HEADERS, timeout=10)
+    test("GET /api/v1/items returns 200", r.status_code == 200)
+    test("items response is a list", isinstance(r.json(), list))
+
+def main():
+    print(f"Running integration tests against {BASE_URL}...")
+    run_tests()
+    print(f"\n{PASS} passed, {FAIL} failed")
+    sys.exit(0 if FAIL == 0 else 1)
+
+if __name__ == "__main__":
+    main()
+```
+
+<Tip>
+  Run `integration_test.py` in the `post_build` phase of your CodeBuild `buildspec.yml` to automatically validate every deployment before it is considered successful.
+</Tip>
+
+## Running Python scripts in CodeBuild
+
+CodeBuild environments include Python 3. Set up the virtual environment in the `install` phase:
+
+```yaml buildspec.yml
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install -r scripts/python/requirements.txt
+
+  post_build:
+    commands:
+      - python3 scripts/python/migrate.py
+      - python3 scripts/python/integration_test.py
+```

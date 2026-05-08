@@ -1,81 +1,131 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "Get Lightpress running locally with Docker Compose"
+description: "Set up your local Lightpress environment in minutes. Clone the repo, configure environment variables, and start all services with one Docker Compose command."
 ---
 
-## Get started in three steps
+Lightpress uses Docker Compose to orchestrate its frontend client, microservices, and supporting dependencies as a unified local environment. You do not need to install language runtimes or databases directly on your machine — Docker handles everything. Follow the steps below to go from zero to a running stack.
 
-Get your documentation site running locally and make your first customization.
+<Info>
+  Docker Desktop (or Docker Engine with the Compose plugin) must be installed before you begin. Download it from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
+</Info>
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Clone the repository">
+    Pull the Lightpress source code onto your machine and enter the project directory.
+
+    ```bash
+    git clone https://github.com/reds-skywalker/Lightpress.git
+    cd Lightpress
+    ```
+
+    The top-level directory contains the four main areas of the project: `client/`, `microservices/`, `infraestructure/`, and `scripts/`, along with the `docker-compose.yml` that ties local development together.
+  </Step>
+
+  <Step title="Configure environment variables">
+    Lightpress services are configured through a `.env` file in the project root. Create yours from the provided example:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    Open `.env` in your editor and fill in values for each service. At minimum you will need to set credentials for any backing services (databases, object storage, etc.) that your microservices depend on.
+
+    <Warning>
+      Never commit your `.env` file. It is already listed in `.gitignore`, but double-check before pushing to a shared branch.
+    </Warning>
+
+    <Tip>
+      Each microservice may also support its own `.env` file inside its subdirectory for service-specific overrides. Check the README inside each service directory as the project grows.
+    </Tip>
+  </Step>
+
+  <Step title="Build and start all services">
+    Run Docker Compose from the project root. The `--build` flag ensures images are built fresh from the local `Dockerfile` in each service directory.
+
+    ```bash
+    docker compose up --build
+    ```
+
+    Docker will build each service image sequentially, then start all containers. On subsequent runs, omit `--build` if no code has changed to skip the build step and start faster.
+
+    ```bash
+    docker compose up
+    ```
+
+    To run the stack in the background (detached mode):
+
+    ```bash
+    docker compose up --build -d
+    ```
+  </Step>
+
+  <Step title="Verify services are running">
+    Once the stack is up, confirm all containers started successfully:
+
+    ```bash
+    docker compose ps
+    ```
+
+    You should see each service listed with a `running` status. A healthy output looks like:
+
+    ```
+    NAME                  SERVICE         STATUS     PORTS
+    lightpress-client     client          running    0.0.0.0:5173->5173/tcp
+    lightpress-api        api             running    0.0.0.0:4000->4000/tcp
+    lightpress-postgres   postgres        running    0.0.0.0:5432->5432/tcp
+    ```
+
+    Open [http://localhost:5173](http://localhost:5173) in your browser to reach the frontend client. API requests are served from [http://localhost:4000](http://localhost:4000) by default.
+
+    <Note>
+      Port numbers depend on what is configured in `docker-compose.yml`. Check that file for the authoritative list as services are added to the project.
+    </Note>
+
+
+  </Step>
+
+  <Step title="Stop the stack">
+    When you're done developing, stop all running containers cleanly:
+
+    ```bash
+    docker compose down
+    ```
+
+    To also remove the named volumes (useful when you want a clean slate for databases):
+
+    ```bash
+    docker compose down -v
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting common issues
 
 <AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
+  <Accordion title="A container exits immediately on startup">
+    Run `docker compose logs <service-name>` to read the output from the failing container. Missing environment variables are the most common cause — confirm every required key in `.env` has a value.
   </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
+  <Accordion title="Port is already in use">
+    Another process on your machine is binding the same port. Either stop that process, or edit `docker-compose.yml` to map the service to a different host port (e.g., change `3000:3000` to `3001:3000`).
+  </Accordion>
+  <Accordion title="docker compose command not found">
+    On older Docker installations, Compose is a separate binary invoked as `docker-compose` (with a hyphen). Try `docker-compose up --build` instead, or upgrade to Docker Desktop v4+ which bundles Compose as a plugin.
   </Accordion>
 </AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture">
+    Understand how the client, microservices, and AWS infrastructure fit together.
+  </Card>
+  <Card title="Deployment" icon="cloud" href="/deployment/overview">
+    Deploy Lightpress to AWS with CloudFormation and CodeBuild.
+  </Card>
+  <Card title="Frontend client" icon="display" href="/features/client">
+    Learn about the structure and conventions of the `client/` directory.
+  </Card>
+  <Card title="Scripts & automation" icon="terminal" href="/scripts/overview">
+    Explore the Bash and Python scripts that automate operational tasks.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

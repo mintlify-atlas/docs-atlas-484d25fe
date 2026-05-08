@@ -1,0 +1,293 @@
+---
+title: "Lightpress FAQ: deployment, scaling, and config"
+description: "Answers to common questions about configuring, developing, deploying, and scaling Lightpress, including microservices, AWS, Docker, and CodeBuild topics."
+---
+
+This page collects the questions that come up most often when working with Lightpress — whether you're onboarding to the codebase, debugging a deployment, or planning infrastructure changes. If your question isn't covered here, open an issue or ask in the team channel.
+
+<AccordionGroup>
+
+  <Accordion title="How do I add a new microservice?" icon="plus">
+    Adding a microservice to Lightpress involves four areas: the service code itself, Docker Compose, the buildspec, and CloudFormation.
+
+    **1. Create the service directory**
+
+    ```bash
+    mkdir -p microservices/my-new-service/src
+    cd microservices/my-new-service
+    npm init -y
+    ```
+
+    Add a `Dockerfile` following the pattern of an existing service (e.g. `microservices/auth-service/Dockerfile`). Include a health check endpoint at `GET /health` — this is required by the ECS load balancer target group.
+
+    **2. Register it in Docker Compose**
+
+    Add a service block to `docker-compose.yml` with the appropriate port, environment variables, and `depends_on` entries. See the [Docker Compose reference](/reference/docker-compose) for the full pattern.
+
+    **3. Update the buildspec**
+
+    The default `buildspec.yml` uses `for dir in microservices/*/` to iterate over all service directories, so new services are picked up automatically as long as each service directory has a valid `Dockerfile` and a `package.json` with `lint` and `test` scripts.
+
+    **4. Add a CloudFormation template**
+
+    Create a new template in `infraestructure/cloudformation/` for the service's ECS task definition, service, and target group. Reference existing templates for the naming conventions and parameter patterns used across the stack.
+
+    **5. Document the service URL**
+
+    Add the new service's URL environment variable (e.g. `MY_NEW_SERVICE_URL`) to `.env.example` and to the [environment variables reference](/reference/environment-variables). Update the environment sections of any service that will call it.
+  </Accordion>
+
+  <Accordion title="How do I update environment variables in production?" icon="sliders">
+    Lightpress production environment variables are stored in AWS Systems Manager Parameter Store (for configuration) and AWS Secrets Manager (for secrets). Avoid changing environment variables directly in ECS task definitions — always update the source in Parameter Store or Secrets Manager and then redeploy.
+
+    **To update a value in Parameter Store:**
+
+    ```bash
+    aws ssm put-parameter \
+      --name "/lightpress/prod/DB_PASSWORD" \
+      --value "new-password-value" \
+      --type SecureString \
+      --overwrite \
+      --region us-east-1
+    ```
+
+    **To update a secret in Secrets Manager:**
+
+    ```bash
+    aws secretsmanager put-secret-value \
+      --secret-id "lightpress/prod/stripe" \
+      --secret-string '{"STRIPE_SECRET_KEY":"sk_live_new_value"}' \
+      --region us-east-1
+    ```
+
+    After updating the value, trigger a redeployment so ECS tasks pick up the new value:
+
+    ```bash
+    aws ecs update-service \
+      --cluster lightpress-prod \
+      --service lightpress-auth-service \
+      --force-new-deployment \
+      --region us-east-1
+    ```
+
+    ECS performs a rolling update, replacing old tasks with new ones that read the updated parameter values at startup. No downtime occurs during a rolling update.
+
+    <Warning>
+      Changes to Parameter Store or Secrets Manager values do not automatically restart running ECS tasks. You must trigger a redeployment for the changes to take effect.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="How do I roll back a deployment?" icon="rotate-left">
+    Lightpress Docker images are tagged with the Git commit SHA (`$CODEBUILD_RESOLVED_SOURCE_VERSION`) in addition to `latest`. This means you can roll back to any previously built commit by pointing ECS at the older image tag.
+
+    **Roll back a specific service to a previous commit:**
+
+    ```bash
+    # 1. Find the commit SHA you want to roll back to
+    git log --oneline
+
+    # 2. Update the ECS task definition to use the previous image tag
+    PREVIOUS_SHA=abc1234def567
+
+    # 3. Register a new task definition revision with the old image
+    aws ecs describe-task-definition \
+      --task-definition lightpress-auth-service \
+      --query taskDefinition > task-def.json
+
+    # Edit task-def.json: change the image tag to $PREVIOUS_SHA
+    # Then register the revised task definition and update the service
+    aws ecs update-service \
+      --cluster lightpress-prod \
+      --service lightpress-auth-service \
+      --task-definition lightpress-auth-service:PREVIOUS_REVISION \
+      --region us-east-1
+    ```
+
+    For infrastructure changes made via CloudFormation, roll back by redeploying the previous template version from `git` or by using CloudFormation's built-in rollback:
+
+    ```bash
+    aws cloudformation cancel-update-stack \
+      --stack-name lightpress-prod \
+      --region us-east-1
+    ```
+
+    <Tip>
+      If you have CodePipeline configured, the easiest rollback path is to revert the offending commit in Git, push to `main`, and let the pipeline redeploy automatically.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="What AWS permissions are required?" icon="shield">
+    The permissions required depend on your role. Three sets of credentials interact with Lightpress:
+
+    **Developer workstation** (for local AWS CLI usage and scripts):
+
+    - `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` — to pull images locally
+    - `ssm:GetParameter`, `ssm:GetParameters` — to read Parameter Store values
+    - `logs:FilterLogEvents`, `logs:GetLogEvents` — to tail CloudWatch logs
+    - `ecs:DescribeServices`, `ecs:DescribeTasks`, `ecs:ListTasks` — to inspect production services
+
+    **CodeBuild service role** (attached to the CodeBuild project):
+
+    - `ecr:*` on the Lightpress ECR repositories
+    - `ecs:UpdateService`, `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskDefinition`
+    - `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` on the client and artifacts buckets
+    - `ssm:GetParameters` on `/lightpress/*`
+    - `secretsmanager:GetSecretValue` on `lightpress/*`
+    - `cloudfront:CreateInvalidation` on the client distribution
+    - `logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents` — for build logs
+
+    **ECS task role** (attached to each running task):
+
+    - `s3:GetObject`, `s3:PutObject` on service-specific bucket prefixes
+    - `sqs:SendMessage`, `sqs:ReceiveMessage`, `sqs:DeleteMessage` on the relevant queues
+    - `ssm:GetParameter` on service-specific parameter paths
+    - `secretsmanager:GetSecretValue` on service-specific secrets
+
+    <Info>
+      Follow the principle of least privilege. Scope IAM policies to specific resource ARNs rather than using wildcards (`*`) where possible.
+    </Info>
+  </Accordion>
+
+  <Accordion title="How do I run only one service locally?" icon="play">
+    Docker Compose lets you start a specific service by name. If the service has `depends_on` entries, Compose also starts those dependencies automatically.
+
+    ```bash
+    # Start only the auth-service (and its dependency, postgres)
+    docker compose up auth-service
+
+    # Start only the client
+    docker compose up client
+
+    # Start without rebuilding the image
+    docker compose up --no-build auth-service
+    ```
+
+    If you want to run a service outside of Docker entirely — for example to use your local Node.js debugger — stop the containerized version first and then start it directly:
+
+    ```bash
+    # Stop only the auth-service container, leave others running
+    docker compose stop auth-service
+
+    # Run the service directly on your machine
+    cd microservices/auth-service
+    npm run dev
+    ```
+
+    Make sure your local `.env` sets `DB_HOST=localhost` (instead of the Docker service name `postgres`) when running services outside the Docker network.
+  </Accordion>
+
+  <Accordion title="How do I debug a failing CodeBuild pipeline?" icon="bug">
+    When a CodeBuild build fails, work through these steps in order:
+
+    **1. Read the phase detail in the console**
+
+    Open the failed build in the AWS CodeBuild console. Expand the phase that shows as `FAILED`. Each command's output is captured — look for the first non-zero exit code and read the lines immediately above it.
+
+    **2. Check for permission errors**
+
+    `AccessDenied` and `not authorized` errors indicate missing IAM permissions on the CodeBuild service role. Identify the exact API action and resource from the error message and add the permission to the role.
+
+    **3. Reproduce locally**
+
+    Run your commands locally in the same order as the `buildspec.yml` phases. This is the fastest iteration loop. For environment-dependent issues, use the [CodeBuild local agent](https://docs.aws.amazon.com/codebuild/latest/userguide/use-codebuild-agent.html):
+
+    ```bash
+    # Pull the CodeBuild local agent image
+    docker pull public.ecr.aws/codebuild/local-builds:latest
+
+    # Run your buildspec locally
+    ./codebuild_build.sh -i aws/codebuild/standard:7.0 -a /tmp/artifacts
+    ```
+
+    **4. Add verbose output**
+
+    Temporarily add `set -x` to the failing phase to print each command before it runs:
+
+    ```yaml
+    phases:
+      build:
+        commands:
+          - set -x
+          - your-failing-command
+    ```
+
+    Remove `set -x` before merging the fix.
+
+    **5. Check CloudWatch Logs**
+
+    Full build logs are also available in CloudWatch Logs under the log group `/aws/codebuild/<project-name>`. Use CloudWatch Logs Insights to search across multiple builds for a pattern.
+  </Accordion>
+
+  <Accordion title="Can I deploy Lightpress to a different cloud provider?" icon="cloud">
+    Lightpress is designed for AWS, and several components have direct AWS dependencies:
+
+    - **CloudFormation** — infrastructure-as-code templates are AWS-specific
+    - **ECR** — Docker image registry used by the buildspec
+    - **ECS** — container orchestration
+    - **S3 + CloudFront** — client hosting and file storage
+    - **SSM Parameter Store / Secrets Manager** — secrets management
+    - **CodeBuild** — CI/CD execution
+
+    Deploying to a different cloud provider would require replacing each of these with equivalents (e.g. Terraform for IaC, GCR or Docker Hub for images, GKE or AKS for containers). The application code itself in `microservices/` and `client/` has no AWS SDK dependencies and is cloud-agnostic.
+
+    A practical middle ground is to keep the application code and Docker Compose setup unchanged while replacing only the infrastructure layer. Use Terraform to provision equivalent resources on GCP or Azure, and replace the `buildspec.yml` with a CI/CD configuration for GitHub Actions or Cloud Build.
+
+    <Info>
+      If you are evaluating a multi-cloud or cloud-agnostic deployment, open an issue on GitHub to discuss it. Architectural changes of this scope benefit from team consensus before implementation.
+    </Info>
+  </Accordion>
+
+  <Accordion title="How do I scale a specific microservice?" icon="arrow-up-right-dots">
+    In production on ECS, you scale a service by adjusting its desired task count. You can do this manually, or configure auto-scaling to do it automatically based on CPU, memory, or custom metrics.
+
+    **Manual scaling:**
+
+    ```bash
+    aws ecs update-service \
+      --cluster lightpress-prod \
+      --service lightpress-auth-service \
+      --desired-count 4 \
+      --region us-east-1
+    ```
+
+    **Automatic scaling with Application Auto Scaling:**
+
+    Define a scaling policy in your CloudFormation template:
+
+    ```yaml
+    AuthServiceScalableTarget:
+      Type: AWS::ApplicationAutoScaling::ScalableTarget
+      Properties:
+        ServiceNamespace: ecs
+        ResourceId: service/lightpress-prod/lightpress-auth-service
+        ScalableDimension: ecs:service:DesiredCount
+        MinCapacity: 2
+        MaxCapacity: 10
+        RoleARN: !GetAtt AutoScalingRole.Arn
+
+    AuthServiceCpuScalingPolicy:
+      Type: AWS::ApplicationAutoScaling::ScalingPolicy
+      Properties:
+        PolicyName: lightpress-auth-cpu-scaling
+        PolicyType: TargetTrackingScaling
+        ScalingTargetId: !Ref AuthServiceScalableTarget
+        TargetTrackingScalingPolicyConfiguration:
+          TargetValue: 60.0
+          PredefinedMetricSpecification:
+            PredefinedMetricType: ECSServiceAverageCPUUtilization
+    ```
+
+    This keeps average CPU utilization near 60%, scaling out when traffic increases and in when it drops.
+
+    **Locally with Docker Compose:**
+
+    Docker Compose does not support ECS-style auto-scaling, but you can run multiple replicas of a service for manual load testing:
+
+    ```bash
+    docker compose up --scale auth-service=3
+    ```
+
+    Note that scaling beyond one instance locally requires removing the fixed port mapping from the service (Compose handles port allocation automatically when scaling).
+  </Accordion>
+
+</AccordionGroup>

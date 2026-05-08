@@ -1,0 +1,267 @@
+---
+title: "Bash scripts reference: deploy, health, and backups"
+description: "Reference for Lightpress Bash scripts: deploy helpers, environment setup, health checks, log collection, and database backup and restore for AWS and Docker."
+---
+
+Bash scripts in `scripts/bash/` handle the operational tasks that tie Lightpress together at the shell level — invoking the AWS CLI, orchestrating Docker containers, and running health checks against live services. Each script is self-contained and executable directly from your terminal or from a CodeBuild `buildspec.yml` phase.
+
+## Making scripts executable
+
+Before running any script for the first time, mark it as executable. This only needs to be done once per script per machine.
+
+```bash
+chmod +x scripts/bash/deploy.sh
+# Or make all bash scripts executable at once
+chmod +x scripts/bash/*.sh
+```
+
+On CI (CodeBuild), scripts are already executable if they were committed with the correct permissions. If they weren't, add a `chmod` call in the `install` phase of `buildspec.yml`.
+
+## Running scripts and passing arguments
+
+Run a script directly from the project root:
+
+```bash
+./scripts/bash/deploy.sh
+```
+
+Most scripts accept positional arguments or read from environment variables. Arguments are documented at the top of each script. For example:
+
+```bash
+# Pass the target environment as the first argument
+./scripts/bash/deploy.sh production
+
+# Or export variables before running
+export AWS_REGION=us-east-1
+export STACK_NAME=lightpress-prod
+./scripts/bash/deploy.sh
+```
+
+<Tip>
+  Sourcing a script (`. ./scripts/bash/setup-env.sh`) exports its variables into your current shell session, which is useful for setup scripts that set `AWS_PROFILE` or similar values.
+</Tip>
+
+## Script reference
+
+### deploy.sh — CloudFormation deployment helper
+
+This script packages and deploys a CloudFormation stack using `aws cloudformation deploy`. It reads the stack name, template path, and S3 artifact bucket from environment variables and streams change-set events to the terminal.
+
+```bash deploy.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+STACK_NAME="${STACK_NAME:-lightpress}"
+TEMPLATE="${TEMPLATE:-infraestructure/cloudformation/main.yaml}"
+ARTIFACT_BUCKET="${ARTIFACT_BUCKET:?ARTIFACT_BUCKET must be set}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+ENVIRONMENT="${1:-staging}"
+
+echo "Deploying stack: $STACK_NAME to $ENVIRONMENT ($AWS_REGION)"
+
+aws cloudformation deploy \
+  --region "$AWS_REGION" \
+  --template-file "$TEMPLATE" \
+  --stack-name "$STACK_NAME-$ENVIRONMENT" \
+  --s3-bucket "$ARTIFACT_BUCKET" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides Environment="$ENVIRONMENT" \
+  --no-fail-on-empty-changeset
+
+echo "Stack deployment complete."
+```
+
+### setup-env.sh — local environment setup
+
+Checks that all required tools are installed, creates the `.env` file from the example template if it does not exist, and validates that required variables are populated.
+
+```bash setup-env.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+command -v docker   >/dev/null 2>&1 || { echo "docker is required but not installed."; exit 1; }
+command -v aws      >/dev/null 2>&1 || { echo "aws CLI is required but not installed."; exit 1; }
+command -v python3  >/dev/null 2>&1 || { echo "python3 is required but not installed."; exit 1; }
+
+if [ ! -f .env ]; then
+  echo ".env not found — copying from .env.example"
+  cp .env.example .env
+  echo "Edit .env with your values before continuing."
+  exit 1
+fi
+
+# Validate required variables are set
+REQUIRED_VARS=("AWS_REGION" "STACK_NAME" "DB_HOST" "DB_PASSWORD")
+for var in "${REQUIRED_VARS[@]}"; do
+  if [ -z "${!var:-}" ]; then
+    echo "Required variable $var is not set in .env"
+    exit 1
+  fi
+done
+
+echo "Environment ready."
+```
+
+### health-check.sh — service health checks
+
+Polls each microservice's health endpoint and exits non-zero if any service is unreachable after a configurable timeout. Suitable for use as a post-deployment gate in CodeBuild.
+
+```bash health-check.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICES=(
+  "http://localhost:3001/health"
+  "http://localhost:3002/health"
+  "http://localhost:3003/health"
+)
+TIMEOUT="${HEALTH_TIMEOUT:-60}"
+INTERVAL=5
+
+check_service() {
+  local url="$1"
+  local deadline=$(( $(date +%s) + TIMEOUT ))
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl --silent --fail --max-time 3 "$url" >/dev/null 2>&1; then
+      echo "  PASS  $url"
+      return 0
+    fi
+    sleep "$INTERVAL"
+  done
+
+  echo "  FAIL  $url (timed out after ${TIMEOUT}s)"
+  return 1
+}
+
+echo "Running health checks..."
+EXIT_CODE=0
+for svc in "${SERVICES[@]}"; do
+  check_service "$svc" || EXIT_CODE=1
+done
+
+exit "$EXIT_CODE"
+```
+
+<Note>
+  When running health checks against AWS services (ECS, ELB), replace the `localhost` URLs with the appropriate load balancer DNS names or service discovery endpoints and export them as environment variables.
+</Note>
+
+### collect-logs.sh — log collection from CloudWatch
+
+Downloads recent log events from a CloudWatch Logs log group and writes them to a local file. Useful for debugging failed deployments or support investigations.
+
+```bash collect-logs.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_GROUP="${LOG_GROUP:?LOG_GROUP must be set}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+HOURS_BACK="${1:-24}"
+OUTPUT_FILE="logs/$(date +%Y%m%d-%H%M%S)-${LOG_GROUP//\//-}.log"
+
+START_TIME=$(( ($(date +%s) - HOURS_BACK * 3600) * 1000 ))
+
+mkdir -p logs
+
+echo "Fetching last ${HOURS_BACK}h of logs from $LOG_GROUP..."
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$LOG_GROUP" \
+  --start-time "$START_TIME" \
+  --query 'events[*].[timestamp,message]' \
+  --output text > "$OUTPUT_FILE"
+
+echo "Logs written to $OUTPUT_FILE ($(wc -l < "$OUTPUT_FILE") lines)"
+```
+
+### db-backup.sh — database backup and restore
+
+<AccordionGroup>
+  <Accordion title="Backup script">
+    Creates a compressed dump of the application database and uploads it to an S3 bucket with a timestamped key. Requires `pg_dump` (PostgreSQL) or `mysqldump` (MySQL) to be installed.
+
+    ```bash db-backup.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:?DB_HOST must be set}"
+    DB_NAME="${DB_NAME:?DB_NAME must be set}"
+    DB_USER="${DB_USER:?DB_USER must be set}"
+    PGPASSWORD="${DB_PASSWORD:?DB_PASSWORD must be set}"
+    BACKUP_BUCKET="${BACKUP_BUCKET:?BACKUP_BUCKET must be set}"
+    AWS_REGION="${AWS_REGION:-us-east-1}"
+    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+    BACKUP_FILE="/tmp/${DB_NAME}-${TIMESTAMP}.sql.gz"
+
+    export PGPASSWORD
+
+    echo "Dumping $DB_NAME from $DB_HOST..."
+    pg_dump -h "$DB_HOST" -U "$DB_USER" "$DB_NAME" | gzip > "$BACKUP_FILE"
+
+    echo "Uploading to s3://$BACKUP_BUCKET/backups/$(basename "$BACKUP_FILE")..."
+    aws s3 cp "$BACKUP_FILE" \
+      "s3://$BACKUP_BUCKET/backups/$(basename "$BACKUP_FILE")" \
+      --region "$AWS_REGION"
+
+    rm -f "$BACKUP_FILE"
+    echo "Backup complete."
+    ```
+  </Accordion>
+  <Accordion title="Restore script">
+    Downloads a backup archive from S3 and restores it into the target database. Pass the S3 key as the first argument.
+
+    ```bash db-restore.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    S3_KEY="${1:?Usage: db-restore.sh <s3-key>}"
+    DB_HOST="${DB_HOST:?DB_HOST must be set}"
+    DB_NAME="${DB_NAME:?DB_NAME must be set}"
+    DB_USER="${DB_USER:?DB_USER must be set}"
+    PGPASSWORD="${DB_PASSWORD:?DB_PASSWORD must be set}"
+    BACKUP_BUCKET="${BACKUP_BUCKET:?BACKUP_BUCKET must be set}"
+    AWS_REGION="${AWS_REGION:-us-east-1}"
+    LOCAL_FILE="/tmp/restore-$(date +%s).sql.gz"
+
+    export PGPASSWORD
+
+    echo "Downloading s3://$BACKUP_BUCKET/$S3_KEY..."
+    aws s3 cp "s3://$BACKUP_BUCKET/$S3_KEY" "$LOCAL_FILE" --region "$AWS_REGION"
+
+    echo "Restoring into $DB_NAME..."
+    gunzip -c "$LOCAL_FILE" | psql -h "$DB_HOST" -U "$DB_USER" "$DB_NAME"
+
+    rm -f "$LOCAL_FILE"
+    echo "Restore complete."
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+  The restore script drops and recreates data in the target database. Always verify you are pointing at the correct `DB_HOST` and `DB_NAME` before running it. Run restores against a staging environment first.
+</Warning>
+
+## Using scripts in CodeBuild
+
+Reference scripts in your `buildspec.yml` by running them directly in the appropriate build phase:
+
+```yaml buildspec.yml
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - chmod +x scripts/bash/*.sh
+      - ./scripts/bash/setup-env.sh
+
+  build:
+    commands:
+      - docker compose build
+
+  post_build:
+    commands:
+      - ./scripts/bash/deploy.sh production
+      - ./scripts/bash/health-check.sh
+```

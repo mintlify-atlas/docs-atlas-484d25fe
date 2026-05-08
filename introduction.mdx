@@ -1,0 +1,65 @@
+---
+title: "Lightpress: Full-Stack SaaS on AWS Microservices"
+description: "Lightpress is a clean, organized full-stack SaaS platform built on a microservices architecture. Deploy confidently on AWS with Docker and CloudFormation."
+---
+
+Lightpress is a production-ready SaaS platform that combines a modern frontend client, independently scalable microservices, and AWS-native infrastructure into one cohesive system. Whether you're onboarding new developers or deploying to production, Lightpress gives you a clean, well-structured starting point.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get your local environment running in minutes with Docker Compose.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the system design: client, microservices, and AWS infrastructure.
+  </Card>
+  <Card title="Deployment" icon="cloud" href="/deployment/overview">
+    Deploy to AWS using CloudFormation templates and CodeBuild pipelines.
+  </Card>
+  <Card title="Scripts & Automation" icon="terminal" href="/scripts/overview">
+    Automate common tasks with the included Bash and Python scripts.
+  </Card>
+</CardGroup>
+
+## What's included
+
+Lightpress ships with everything you need to run a scalable SaaS product:
+
+- **Frontend client** — A dedicated `client/` directory for your user-facing application
+- **Microservices** — Independent services in `microservices/` that scale and deploy separately
+- **AWS infrastructure** — CloudFormation templates in `infraestructure/cloudformation/` for repeatable provisioning
+- **CI/CD pipeline** — A `buildspec.yml` for AWS CodeBuild to automate your build and deployment workflow
+- **Docker Compose** — Local multi-service orchestration for development and testing
+- **Automation scripts** — Bash and Python scripts to handle operational tasks
+
+## Get started
+
+<Steps>
+  <Step title="Clone the repository">
+    Get the Lightpress source code onto your local machine.
+    ```bash
+    git clone https://github.com/reds-skywalker/Lightpress.git
+    cd Lightpress
+    ```
+  </Step>
+  <Step title="Configure your environment">
+    Create a `.env` file at the project root with the values each service needs. Use the [environment variables reference](/reference/environment-variables) as a guide, or copy the example template if one has been committed:
+    ```bash
+    cp .env.example .env
+    # Edit .env with your configuration
+    ```
+  </Step>
+  <Step title="Start services locally">
+    Use Docker Compose to spin up all services in a single command.
+    ```bash
+    docker compose up --build
+    ```
+  </Step>
+  <Step title="Deploy to AWS">
+    Provision infrastructure with CloudFormation and trigger your first build.
+    See the [Deployment guide](/deployment/overview) for full details.
+  </Step>
+</Steps>
+
+<Note>
+  Looking for deployment instructions? Head to the [Deployment overview](/deployment/overview) for a step-by-step guide to getting Lightpress running on AWS.
+</Note>

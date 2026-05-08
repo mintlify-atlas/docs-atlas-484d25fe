@@ -1,0 +1,233 @@
+---
+title: "Automate deployments with AWS CodeBuild and buildspec"
+description: "Automate Lightpress builds with AWS CodeBuild and buildspec.yml. Covers build phases, source triggers, environment variables, and log access."
+---
+
+Lightpress uses AWS CodeBuild as its CI/CD engine. CodeBuild reads `buildspec.yml` from the repository root and executes a defined sequence of build phases — from installing dependencies through building Docker images to pushing artifacts and triggering deployments. Because CodeBuild is fully managed, you do not need to provision or maintain build servers.
+
+## How `buildspec.yml` works
+
+When a build starts, CodeBuild clones your source repository, then reads `buildspec.yml` to determine what commands to run and in what order. The file is divided into named phases that execute sequentially. If any command in a phase exits with a non-zero status, CodeBuild marks the build as failed and stops execution.
+
+A complete `buildspec.yml` for Lightpress follows this structure:
+
+```yaml buildspec.yml
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: us-east-1
+  parameter-store:
+    DB_PASSWORD: /lightpress/production/db_password
+    ECR_REPO_URI: /lightpress/production/ecr_repo_uri
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+      python: 3.11
+    commands:
+      - echo "Installing dependencies..."
+      - npm ci --prefix client
+      - pip install -r scripts/python/requirements.txt
+
+  pre_build:
+    commands:
+      - echo "Running pre-build checks..."
+      - npm run lint --prefix client
+      - npm test --prefix client
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_URI
+
+  build:
+    commands:
+      - echo "Building Docker images..."
+      - docker build -t lightpress-api ./microservices/api
+      - docker build -t lightpress-client ./client
+      - docker tag lightpress-api:latest $ECR_REPO_URI/lightpress-api:$CODEBUILD_RESOLVED_SOURCE_VERSION
+      - docker tag lightpress-client:latest $ECR_REPO_URI/lightpress-client:$CODEBUILD_RESOLVED_SOURCE_VERSION
+
+  post_build:
+    commands:
+      - echo "Pushing images to ECR..."
+      - docker push $ECR_REPO_URI/lightpress-api:$CODEBUILD_RESOLVED_SOURCE_VERSION
+      - docker push $ECR_REPO_URI/lightpress-client:$CODEBUILD_RESOLVED_SOURCE_VERSION
+      - echo "Updating CloudFormation stack..."
+      - aws cloudformation deploy
+          --template-file infraestructure/cloudformation/packaged.yaml
+          --stack-name lightpress-production
+          --parameter-overrides AppVersion=$CODEBUILD_RESOLVED_SOURCE_VERSION
+          --capabilities CAPABILITY_NAMED_IAM
+
+artifacts:
+  files:
+    - infraestructure/cloudformation/**/*
+    - scripts/**/*
+```
+
+## Build phases
+
+Each phase has a specific responsibility in the pipeline:
+
+<AccordionGroup>
+  <Accordion title="install — set up runtimes and dependencies" defaultOpen={true}>
+    CodeBuild provisions a fresh build environment for every run. The `install` phase declares the runtime versions to use (Node.js 18 and Python 3.11 for Lightpress) and installs project dependencies.
+
+    Commands here run before any application code is executed. Keep this phase focused on dependency installation — `npm ci`, `pip install`, and similar commands.
+
+    ```yaml
+    install:
+      runtime-versions:
+        nodejs: 18
+        python: 3.11
+      commands:
+        - npm ci --prefix client
+        - pip install -r scripts/python/requirements.txt
+    ```
+  </Accordion>
+  <Accordion title="pre_build — lint, test, and authenticate">
+    The `pre_build` phase runs quality gates and prepares credentials before the main build. For Lightpress this includes running linters and tests against the `client/` code, and authenticating the Docker daemon with Amazon ECR so it can push images in later phases.
+
+    ```yaml
+    pre_build:
+      commands:
+        - npm run lint --prefix client
+        - npm test --prefix client
+        - aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+            docker login --username AWS --password-stdin $ECR_REPO_URI
+    ```
+
+    A test failure here stops the build before any images are built or pushed, preventing a broken build from reaching production.
+  </Accordion>
+  <Accordion title="build — compile and build Docker images">
+    The `build` phase compiles application code and produces Docker images for each Lightpress service. Images are tagged with `$CODEBUILD_RESOLVED_SOURCE_VERSION` — a unique identifier for the source commit — so every image is traceable back to the exact code that produced it.
+
+    ```yaml
+    build:
+      commands:
+        - docker build -t lightpress-api ./microservices/api
+        - docker build -t lightpress-client ./client
+        - docker tag lightpress-api:latest $ECR_REPO_URI/lightpress-api:$CODEBUILD_RESOLVED_SOURCE_VERSION
+        - docker tag lightpress-client:latest $ECR_REPO_URI/lightpress-client:$CODEBUILD_RESOLVED_SOURCE_VERSION
+    ```
+  </Accordion>
+  <Accordion title="post_build — push images and deploy">
+    The `post_build` phase pushes the built images to Amazon ECR and triggers a CloudFormation stack update to deploy the new version. This phase runs even if the `build` phase fails — use the `CODEBUILD_BUILD_SUCCEEDING` environment variable if you need to skip post-build steps on failure.
+
+    ```yaml
+    post_build:
+      commands:
+        - docker push $ECR_REPO_URI/lightpress-api:$CODEBUILD_RESOLVED_SOURCE_VERSION
+        - docker push $ECR_REPO_URI/lightpress-client:$CODEBUILD_RESOLVED_SOURCE_VERSION
+        - aws cloudformation deploy --stack-name lightpress-production ...
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Connecting a source repository
+
+<Steps>
+  <Step title="Open CodeBuild in the AWS console">
+    Navigate to **AWS CodeBuild** in the AWS Management Console and choose **Create build project**.
+  </Step>
+  <Step title="Configure the source provider">
+    Under **Source**, select your repository provider:
+
+    - **GitHub** — authorize with OAuth or a personal access token
+    - **AWS CodeCommit** — select the repository from the dropdown
+    - **Bitbucket** — authorize with OAuth
+
+    Set the **Source version** to the branch you want to build (for example, `main`).
+  </Step>
+  <Step title="Set the environment">
+    Choose a managed build image. For Lightpress, select:
+
+    - **Operating system**: Amazon Linux 2023
+    - **Runtime**: Standard
+    - **Image**: `aws/codebuild/standard:7.0` (includes Node.js 18 and Python 3.11)
+    - **Privileged mode**: enabled (required for building Docker images)
+
+    <Warning>
+      Privileged mode grants elevated permissions to the build container. Only enable it when Docker builds are required, and ensure your CodeBuild service role has a restrictive IAM policy.
+    </Warning>
+  </Step>
+  <Step title="Point to buildspec.yml">
+    Under **Buildspec**, select **Use a buildspec file**. CodeBuild will automatically read `buildspec.yml` from the repository root. If your file is in a subdirectory, enter the relative path.
+  </Step>
+  <Step title="Create the project">
+    Choose **Create build project**. The project is now ready to run builds manually or in response to source triggers.
+  </Step>
+</Steps>
+
+## Triggering builds
+
+<Tabs>
+  <Tab title="Manual trigger">
+    Start a build from the console by choosing **Start build** on the project page, or from the CLI:
+
+    ```bash
+    aws codebuild start-build \
+      --project-name lightpress-production
+    ```
+  </Tab>
+  <Tab title="Webhook trigger">
+    Configure a webhook so CodeBuild starts a build automatically on every push to `main`:
+
+    ```bash
+    aws codebuild create-webhook \
+      --project-name lightpress-production \
+      --filter-groups "[[{\"type\":\"EVENT\",\"pattern\":\"PUSH\"},{\"type\":\"HEAD_REF\",\"pattern\":\"refs/heads/main\"}]]"
+    ```
+
+    For GitHub, CodeBuild creates the webhook in your repository automatically when you save the project with **Rebuild every time a code change is pushed to this repository** enabled.
+  </Tab>
+  <Tab title="CodePipeline">
+    Add CodeBuild as a build action in an AWS CodePipeline pipeline for more advanced workflows, such as requiring manual approval before deploying to production.
+  </Tab>
+</Tabs>
+
+## Viewing build logs
+
+Build logs stream to Amazon CloudWatch Logs automatically. You can view them in real time from the CodeBuild console or from the CLI:
+
+```bash
+# Get the most recent build ID for a project
+BUILD_ID=$(aws codebuild list-builds-for-project \
+  --project-name lightpress-production \
+  --query "ids[0]" \
+  --output text)
+
+# Stream the build log
+aws codebuild batch-get-builds \
+  --ids $BUILD_ID \
+  --query "builds[0].logs.deepLink" \
+  --output text
+```
+
+<Tip>
+  Open the **deep link** URL returned by the command above in your browser to view the full real-time log stream in the CloudWatch Logs console.
+</Tip>
+
+## Environment variables in CodeBuild
+
+CodeBuild supports three types of environment variables, each suited to a different sensitivity level:
+
+| Type | Use for | How to set |
+|---|---|---|
+| Plaintext | Non-sensitive config like region names | Defined in `buildspec.yml` under `env.variables` or in the project settings |
+| SSM Parameter Store | Credentials and tokens | Reference with `parameter-store` in `buildspec.yml`; CodeBuild fetches at build time |
+| Secrets Manager | Rotating secrets and database passwords | Reference with `secrets-manager` in `buildspec.yml` |
+
+To add a parameter from SSM in `buildspec.yml`:
+
+```yaml buildspec.yml
+env:
+  parameter-store:
+    DB_PASSWORD: /lightpress/production/db_password
+    ECR_REPO_URI: /lightpress/production/ecr_repo_uri
+```
+
+The CodeBuild service role must have `ssm:GetParameters` permission for the referenced paths.
+
+<Info>
+  CodeBuild also injects several built-in environment variables you can use in your commands — for example, `$CODEBUILD_BUILD_ID`, `$CODEBUILD_RESOLVED_SOURCE_VERSION` (the full commit SHA), and `$CODEBUILD_BUILD_SUCCEEDING` (set to `0` if any prior phase failed).
+</Info>
